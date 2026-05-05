@@ -73,4 +73,3 @@ No router, no state library, no CSS framework. Routing is `window.location.hash`
 ## Status
 
 This is a mockup. Data is synthetic — 257K findings across 5,000 fictional assets, deterministic by seed. See the "Caveats & things deliberately not built" section in `STRATA.md` for the honest list of what's stubbed.
-"# concept" 

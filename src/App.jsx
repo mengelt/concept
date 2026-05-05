@@ -6,7 +6,7 @@ import {
   Sun, Moon, Crown, Star, Circle, User, Link2,
   Wrench, Calendar, AlertCircle, Clock, TrendingDown, Info,
   Mail, Hash, MapPin, Tag as TagIcon, ExternalLink, Phone,
-  Palette, Check, Copy
+  Palette, Check, Copy, Users, UserPlus, Search
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +305,48 @@ const APP_FRAGS    = ['checkout', 'auth', 'billing', 'search', 'inventory', 'gat
 const DB_FRAGS     = ['users', 'orders', 'inventory', 'analytics', 'sessions', 'products', 'payments', 'audit', 'logs'];
 const CTR_FRAGS    = ['runner', 'worker', 'sidecar', 'cron', 'sandbox', 'builder', 'queue', 'cache'];
 const TEAMS        = ['payments', 'platform', 'growth', 'data', 'infra', 'ml', 'security', 'commerce', 'ops', 'web'];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PEOPLE ROSTER  ─  fake employees for assignment
+// ─────────────────────────────────────────────────────────────────────────────
+const AVATAR_COLORS = [
+  '#dc6e3d', '#3b8c5b', '#2f6f9e', '#8a4a98', '#a36b1d',
+  '#a83253', '#356d6b', '#6b5dba', '#8b6f3d', '#5c8a2c',
+  '#ae3a3a', '#3d7a8c', '#7a4a3d', '#5a8038', '#9c4a7a',
+];
+
+function makePerson(first, last, team, role) {
+  const id = `${first}.${last}`.toLowerCase();
+  const initials = (first[0] + last[0]).toUpperCase();
+  const color = AVATAR_COLORS[hashStr(id) % AVATAR_COLORS.length];
+  return { id, name: `${first} ${last}`, first, last, team, role, initials, color };
+}
+
+const PEOPLE = [
+  makePerson('Jane',     'Doe',       'security',  'Security Eng'),
+  makePerson('Marcus',   'Chen',      'security',  'Security Eng'),
+  makePerson('Priya',    'Patel',     'security',  'Security Lead'),
+  makePerson('Sam',      'Okafor',    'platform',  'Platform Eng'),
+  makePerson('Lukas',    'Mueller',   'platform',  'Platform Eng'),
+  makePerson('Iris',     'Tanaka',    'platform',  'Platform Lead'),
+  makePerson('Akira',    'Yamada',    'infra',     'SRE'),
+  makePerson('Maria',    'Garcia',    'infra',     'SRE'),
+  makePerson('Derek',    'Ross',      'infra',     'Infra Lead'),
+  makePerson('Noor',     'Khan',      'data',      'Data Eng'),
+  makePerson('Chen',     'Liu',       'data',      'DBA'),
+  makePerson('Rosa',     'Silva',     'payments',  'Backend Eng'),
+  makePerson('Ola',      'Johansson', 'payments',  'Backend Eng'),
+  makePerson('Fatima',   'Khalil',    'payments',  'Tech Lead'),
+  makePerson('Kai',      'Weber',     'web',       'Frontend Eng'),
+  makePerson('Sofia',    'Rossi',     'web',       'Frontend Eng'),
+  makePerson('Benji',    'Park',      'commerce',  'Backend Eng'),
+  makePerson('Hana',     'Kim',       'commerce',  'Tech Lead'),
+  makePerson('Theo',     'Singh',     'ops',       'Ops Eng'),
+  makePerson('Yara',     'Hassan',    'ops',       'Ops Lead'),
+  makePerson('Ren',      'Watanabe',  'ml',        'ML Eng'),
+  makePerson('Eva',      'Nilsson',   'growth',    'Backend Eng'),
+];
+const PEOPLE_BY_ID = new Map(PEOPLE.map(p => [p.id, p]));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BUILD BUCKETS — pre-computed aggregates
@@ -715,6 +757,236 @@ function CritBadge({ tier, sm = false }) {
     </span>
   );
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// AVATAR — circular, MUI-style, color-coded initials with optional photo
+// ─────────────────────────────────────────────────────────────────────────────
+function Avatar({ person, size = 28, ring = true }) {
+  if (!person) return null;
+  const fontSize = Math.round(size * 0.4);
+  return (
+    <div
+      title={`${person.name} · ${person.role} · team-${person.team}`}
+      style={{
+        width: size, height: size, borderRadius: '50%',
+        background: person.color, color: '#fff',
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        fontSize, fontWeight: 600, fontFamily: "'IBM Plex Sans', sans-serif",
+        letterSpacing: '0.02em',
+        flexShrink: 0,
+        border: ring ? `2px solid var(--bg)` : 'none',
+        boxSizing: 'border-box',
+      }}
+    >
+      {person.initials}
+    </div>
+  );
+}
+
+// AvatarStack — overlapped circles with a +N overflow chip
+function AvatarStack({ people, size = 28, max = 4, onClick }) {
+  if (!people || people.length === 0) return null;
+  const overflow = people.length - max;
+  const shown = overflow > 0 ? people.slice(0, max) : people;
+  const overlap = Math.round(size * 0.32);
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        display: 'inline-flex', alignItems: 'center',
+        cursor: onClick ? 'pointer' : 'default',
+      }}
+    >
+      {shown.map((p, i) => (
+        <div key={p.id} style={{ marginLeft: i === 0 ? 0 : -overlap, zIndex: shown.length - i, position: 'relative' }}>
+          <Avatar person={p} size={size} />
+        </div>
+      ))}
+      {overflow > 0 && (
+        <div
+          title={`${overflow} more`}
+          style={{
+            marginLeft: -overlap, zIndex: 0,
+            width: size, height: size, borderRadius: '50%',
+            background: 'var(--surface-3)', color: 'var(--text)',
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: Math.round(size * 0.36), fontWeight: 600,
+            fontFamily: "'IBM Plex Sans', sans-serif",
+            border: `2px solid var(--bg)`, boxSizing: 'border-box',
+          }}
+        >+{overflow}</div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PEOPLE PICKER MODAL
+// ─────────────────────────────────────────────────────────────────────────────
+function PeoplePickerModal({ open, initialSelected, bucket, onClose, onApply }) {
+  const [selected, setSelected] = useState(new Set(initialSelected || []));
+  const [search, setSearch] = useState('');
+  const [teamFilter, setTeamFilter] = useState('all');
+
+  useEffect(() => {
+    if (open) {
+      setSelected(new Set(initialSelected || []));
+      setSearch('');
+      setTeamFilter('all');
+    }
+  }, [open, initialSelected]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return PEOPLE.filter(p => {
+      if (teamFilter !== 'all' && p.team !== teamFilter) return false;
+      if (!q) return true;
+      return p.name.toLowerCase().includes(q) ||
+             p.id.includes(q) ||
+             p.role.toLowerCase().includes(q) ||
+             p.team.toLowerCase().includes(q);
+    });
+  }, [search, teamFilter]);
+
+  if (!open) return null;
+
+  const toggle = (id) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setSelected(next);
+  };
+  const apply = () => {
+    onApply(Array.from(selected));
+    onClose();
+  };
+  const teamsPresent = Array.from(new Set(PEOPLE.map(p => p.team))).sort();
+
+  return (
+    <>
+      <div onClick={onClose} className="fade-in" style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 60,
+      }}/>
+      <div className="fade-in" style={{
+        position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+        width: 'min(560px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)',
+        background: 'var(--surface)', border: `1px solid var(--border-bright)`,
+        zIndex: 61, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      }}>
+        {/* header */}
+        <div style={{ padding: '20px 24px', borderBottom: `1px solid var(--border)`, display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16 }}>
+          <div>
+            <div className="label" style={{ marginBottom: 6 }}>Assign people</div>
+            <div className="display" style={{ fontSize: 22, fontWeight: 500, color: 'var(--text)' }}>
+              {bucket ? <><span style={{ color: 'var(--text-dim)' }}>{bucket.verb}</span> {bucket.noun}</> : 'Campaign'}
+            </div>
+          </div>
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', padding: 4 }}>
+            <X size={18}/>
+          </button>
+        </div>
+
+        {/* search + filter */}
+        <div style={{ padding: '14px 24px', borderBottom: `1px solid var(--border)`, display: 'flex', gap: 8, background: 'var(--surface-2)' }}>
+          <div style={{ flex: 1, position: 'relative' }}>
+            <Search size={13} color="var(--text-dim)" style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }} />
+            <input
+              type="text" value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search by name, role, or team..."
+              autoFocus
+              style={{
+                width: '100%', background: 'var(--bg)', color: 'var(--text)',
+                border: `1px solid var(--border)`, padding: '7px 10px 7px 30px', fontSize: 13,
+                fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <FilterSelect value={teamFilter} onChange={setTeamFilter} options={[
+            ['all', 'All teams'],
+            ...teamsPresent.map(t => [t, `team-${t}`]),
+          ]} w={130} />
+        </div>
+
+        {/* selected summary */}
+        <div style={{ padding: '10px 24px', borderBottom: `1px solid var(--border)`, fontSize: 12, color: 'var(--text-dim)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+          <span>
+            {selected.size === 0
+              ? 'No one assigned yet'
+              : `${selected.size} ${selected.size === 1 ? 'person' : 'people'} selected`}
+          </span>
+          {selected.size > 0 && (
+            <AvatarStack people={Array.from(selected).map(id => PEOPLE_BY_ID.get(id)).filter(Boolean)} size={22} max={6} />
+          )}
+        </div>
+
+        {/* list */}
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          {filtered.length === 0 && (
+            <div style={{ padding: 32, textAlign: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
+              No people match.
+            </div>
+          )}
+          {filtered.map(p => {
+            const isSelected = selected.has(p.id);
+            return (
+              <button
+                key={p.id} onClick={() => toggle(p.id)}
+                className="clickable"
+                style={{
+                  width: '100%', background: isSelected ? 'var(--accent-soft)' : 'transparent',
+                  border: 'none', borderBottom: `1px solid var(--border)`,
+                  padding: '10px 24px', display: 'flex', alignItems: 'center', gap: 12,
+                  color: 'var(--text)', textAlign: 'left',
+                }}
+              >
+                <Avatar person={p} size={32} ring={false} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{p.name}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                    {p.role} <span style={{ color: 'var(--text-faint)' }}>·</span> team-{p.team}
+                  </div>
+                </div>
+                <div style={{
+                  width: 18, height: 18, border: `1.5px solid ${isSelected ? 'var(--accent)' : 'var(--border-bright)'}`,
+                  background: isSelected ? 'var(--accent)' : 'transparent',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                }}>
+                  {isSelected && <Check size={12} color="var(--bg)" strokeWidth={3} />}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* footer */}
+        <div style={{ padding: '14px 24px', borderTop: `1px solid var(--border)`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <button onClick={() => setSelected(new Set())} disabled={selected.size === 0} style={{
+            background: 'transparent', border: 'none',
+            color: selected.size === 0 ? 'var(--text-faint)' : 'var(--text-dim)',
+            padding: '6px 0', fontSize: 12, cursor: selected.size === 0 ? 'default' : 'pointer',
+          }}>Clear all</button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button onClick={onClose} style={{
+              background: 'transparent', border: `1px solid var(--border)`, color: 'var(--text)',
+              padding: '8px 14px', fontSize: 12,
+            }}>Cancel</button>
+            <button onClick={apply} style={{
+              background: 'var(--accent)', border: `1px solid var(--accent)`, color: 'var(--bg)',
+              padding: '8px 14px', fontSize: 12, fontWeight: 600,
+            }}>Apply</button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function CopyButton({ value, sm = false }) {
   const [copied, setCopied] = useState(false);
   const handleClick = (e) => {
@@ -1202,7 +1474,7 @@ function dominantSevIdx(sevCounts) {
   return idx;
 }
 function TreemapCell(props) {
-  const { x, y, width, height, verb, noun, hours, count, sevIdx, id, onPick, theme } = props;
+  const { x, y, width, height, verb, noun, hours, count, sevIdx, id, onPick, theme, assignees } = props;
   if (!width || !height || width < 1 || height < 1) return null;
   const C = cellPalette(theme);
   const sevColor = C.sev[sevIdx ?? 3];
@@ -1210,36 +1482,52 @@ function TreemapCell(props) {
   const showFull = width > 110 && height > 70;
   const showSmall = width > 60 && height > 40;
   const washOpacity = C.washOpacity;
+  const hasAssignees = assignees && assignees.length > 0;
+  // shrink avatar size and max count for narrower cells
+  const avatarSize = width > 200 ? 22 : width > 140 ? 20 : 18;
+  const avatarMax = width > 220 ? 4 : width > 160 ? 3 : 2;
   return (
     <g style={{ cursor: id ? 'pointer' : 'default' }} onClick={() => id && onPick && onPick(id)}>
       <rect x={x} y={y} width={width} height={height} fill={C.surface2} stroke={C.bg} strokeWidth={2} />
       <rect x={x} y={y} width={width} height={height} fill={sevColor} fillOpacity={washOpacity} />
       <rect x={x} y={y} width={6} height={height} fill={sevColor} />
+      {/* "unassigned" left-edge dim if no one is on it — same width as severity strip but desaturated.
+          Only on the bottom half so it doesn't fight the severity strip visually. */}
+      {!hasAssignees && showSmall && (
+        <rect x={x + 6} y={y + height - 3} width={width - 6} height={3} fill={C.textDim} fillOpacity={0.2} />
+      )}
       {showSmall && (
-        <foreignObject x={x + 18} y={y + 16} width={Math.max(0, width - 36)} height={Math.max(0, height - 32)}>
+        <foreignObject x={x + 18} y={y + 14} width={Math.max(0, width - 36)} height={Math.max(0, height - 28)}>
           <div xmlns="http://www.w3.org/1999/xhtml" style={{
             width: '100%', height: '100%',
             display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
             overflow: 'hidden',
             fontFamily: "'IBM Plex Sans', sans-serif",
           }}>
-            <div style={{ minWidth: 0 }}>
-              {showFull && (
+            <div style={{ minWidth: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                {showFull && (
+                  <div style={{
+                    color: sevColorCss,
+                    fontSize: 11, fontWeight: 700,
+                    textTransform: 'uppercase', letterSpacing: '0.16em',
+                    marginBottom: 8, lineHeight: 1,
+                  }}>{verb}</div>
+                )}
                 <div style={{
-                  color: sevColorCss,
-                  fontSize: 11, fontWeight: 700,
-                  textTransform: 'uppercase', letterSpacing: '0.16em',
-                  marginBottom: 8, lineHeight: 1,
-                }}>{verb}</div>
+                  color: 'var(--text)',
+                  fontSize: showFull ? 18 : 13,
+                  fontWeight: 600,
+                  letterSpacing: '-0.01em',
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  lineHeight: 1.2,
+                }}>{noun}</div>
+              </div>
+              {hasAssignees && (
+                <div style={{ flexShrink: 0, marginTop: showFull ? -2 : 0 }}>
+                  <AvatarStack people={assignees} size={avatarSize} max={avatarMax} />
+                </div>
               )}
-              <div style={{
-                color: 'var(--text)',
-                fontSize: showFull ? 18 : 13,
-                fontWeight: 600,
-                letterSpacing: '-0.01em',
-                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                lineHeight: 1.2,
-              }}>{noun}</div>
             </div>
             <div style={{
               display: 'flex', justifyContent: 'space-between',
@@ -1272,12 +1560,13 @@ function TreemapCell(props) {
     </g>
   );
 }
-function CampaignTreemap({ buckets, hoursMap, onPick, theme }) {
+function CampaignTreemap({ buckets, hoursMap, onPick, theme, assignmentsByBucket }) {
   const data = buckets.map(b => ({
     name: `${b.verb} ${b.noun}`,
     size: hoursMap[b.id],
     verb: b.verb, noun: b.noun, hours: hoursMap[b.id], count: b.count,
     sevIdx: dominantSevIdx(b.sevCounts), id: b.id,
+    assignees: assignmentsByBucket ? assignmentsByBucket(b.id) : [],
   }));
   const C = cellPalette(theme);
   return (
@@ -1351,7 +1640,7 @@ const MULT_TIP_CRIT = {
 // ─────────────────────────────────────────────────────────────────────────────
 function BreakdownRow({ label, sub, subTip, value, total, color, valueLabel }) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr 64px', gap: 12, alignItems: 'center', padding: '6px 0', fontSize: 12 }}>
+    <div style={{ display: 'grid', gridTemplateColumns: '150px 1fr 60px', gap: 10, alignItems: 'center', padding: '6px 0', fontSize: 12 }}>
       <span style={{ color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
         {label}
         {sub && (
@@ -1378,7 +1667,7 @@ function BreakdownRow({ label, sub, subTip, value, total, color, valueLabel }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // BUCKET DETAIL
 // ─────────────────────────────────────────────────────────────────────────────
-function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown }) {
+function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown, assignedPeople, onOpenPicker }) {
   const [filterAsset, setFilterAsset] = useState('all');
   const [filterEnv, setFilterEnv] = useState('all');
   const [filterCrit, setFilterCrit] = useState('all');
@@ -1450,6 +1739,57 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
           <StatNum value={fmtHours(hours)} label="Estimated Effort" accent="var(--accent)" sub={fmtHoursDetail(hours)} />
           <StatNum value={fmtNum(Math.round(bucket.riskScore))} label="Risk Score" accent="var(--sev-critical)" sub="severity-weighted" />
         </div>
+      </div>
+
+      {/* assignment strip */}
+      <div style={{
+        padding: '18px 28px', borderBottom: `1px solid var(--border)`,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, minWidth: 0 }}>
+          <div style={{ flexShrink: 0 }}>
+            <div className="label" style={{ marginBottom: 4 }}>Assigned to</div>
+            {assignedPeople && assignedPeople.length > 0 ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <AvatarStack people={assignedPeople} size={32} max={6} />
+                <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+                  {assignedPeople.length} {assignedPeople.length === 1 ? 'person' : 'people'}
+                </span>
+              </div>
+            ) : (
+              <div style={{ fontSize: 13, color: 'var(--text-faint)', fontStyle: 'italic' }}>
+                Unassigned — nobody is currently working this campaign
+              </div>
+            )}
+          </div>
+          {assignedPeople && assignedPeople.length > 0 && (
+            <div style={{
+              paddingLeft: 16, marginLeft: 4,
+              borderLeft: `1px solid var(--border)`,
+              display: 'flex', flexDirection: 'column', gap: 2,
+              fontSize: 11, color: 'var(--text-dim)', minWidth: 0,
+            }}>
+              {assignedPeople.slice(0, 3).map(p => (
+                <span key={p.id} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ color: 'var(--text)' }}>{p.name}</span>
+                  <span style={{ color: 'var(--text-faint)' }}> · {p.role} · team-{p.team}</span>
+                </span>
+              ))}
+              {assignedPeople.length > 3 && (
+                <span style={{ color: 'var(--text-faint)' }}>+ {assignedPeople.length - 3} more</span>
+              )}
+            </div>
+          )}
+        </div>
+        <button onClick={() => onOpenPicker && onOpenPicker(bucket.id)} className="card-hover" style={{
+          background: assignedPeople && assignedPeople.length > 0 ? 'transparent' : 'var(--accent)',
+          color: assignedPeople && assignedPeople.length > 0 ? 'var(--text)' : 'var(--bg)',
+          border: `1px solid ${assignedPeople && assignedPeople.length > 0 ? 'var(--border)' : 'var(--accent)'}`,
+          padding: '8px 14px', fontSize: 12, fontWeight: 600,
+          display: 'inline-flex', alignItems: 'center', gap: 6, flexShrink: 0,
+        }}>
+          {assignedPeople && assignedPeople.length > 0 ? <><Users size={13} /> Manage assignees</> : <><UserPlus size={13} /> Assign people</>}
+        </button>
       </div>
 
       {/* policy + burndown strip */}
@@ -1663,7 +2003,11 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
                   <span className="mono" style={{ color: a.oldestAge > SLA_DAYS[a.worstSeverity] ? 'var(--sev-critical)' : 'var(--text-dim)', fontSize: 11, fontVariantNumeric: 'tabular-nums' }}>
                     {a.oldestAge}d
                   </span>
-                  <SlaBadge status={slaState} count={a.breachedTotal || a.approachingTotal} sm />
+                  <span>
+                    {slaState
+                      ? <SlaBadge status={slaState} count={a.breachedTotal || a.approachingTotal} sm />
+                      : <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>—</span>}
+                  </span>
                   <span className="mono" style={{ color: 'var(--text-dim)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.cve}</span>
                 </div>
               );
@@ -2060,6 +2404,20 @@ export default function App() {
   const [showEstimates, setShowEstimates] = useState(false);
   const [metaAssetId, setMetaAssetId] = useState(null);
 
+  // Per-campaign assignments — Map<bucketId, string[] personIds>.
+  // Seed a handful so the demo shows the avatar overlay out of the box.
+  const [assignments, setAssignments] = useState(() => ({
+    'patch-log4j':       ['priya.patel', 'marcus.chen', 'sam.okafor', 'iris.tanaka'],
+    'upgrade-openssl':   ['priya.patel', 'akira.yamada'],
+    'patch-apache':      ['lukas.mueller', 'sam.okafor'],
+    'upgrade-postgres':  ['noor.khan', 'chen.liu'],
+    'rotate-ssh':        ['derek.ross', 'maria.garcia', 'akira.yamada'],
+    'upgrade-k8s':       ['iris.tanaka', 'sam.okafor', 'lukas.mueller', 'derek.ross', 'akira.yamada'],
+    'enable-mfa':        ['jane.doe'],
+    'upgrade-rhel':      ['akira.yamada', 'maria.garcia'],
+  }));
+  const [pickerBucketId, setPickerBucketId] = useState(null);
+
   // Apply theme to root via setProperty — supports any theme key in THEMES.
   useEffect(() => {
     applyThemeVars(route.theme);
@@ -2079,9 +2437,18 @@ export default function App() {
   const selectTheme = (next) => navigate(undefined, next);
   const openMeta = (assetId) => setMetaAssetId(assetId);
   const closeMeta = () => setMetaAssetId(null);
+  const openPicker = (bucketId) => setPickerBucketId(bucketId);
+  const closePicker = () => setPickerBucketId(null);
+  const applyAssignment = (bucketId, personIds) => {
+    setAssignments(prev => ({ ...prev, [bucketId]: personIds }));
+  };
+  // Helper: turn personId list into Person objects, filtering unknowns
+  const peopleFor = (bucketId) => (assignments[bucketId] || [])
+    .map(id => PEOPLE_BY_ID.get(id)).filter(Boolean);
 
   const selectedBucket = (route.kind === 'bucket' || route.kind === 'asset') ? buckets.find(b => b.id === route.bucketId) : null;
   const metaAsset = metaAssetId ? world.assetMap.get(metaAssetId) : null;
+  const pickerBucket = pickerBucketId ? buckets.find(b => b.id === pickerBucketId) : null;
 
   // If a deep-link points at an unknown bucket from a bucket route, recover
   useEffect(() => {
@@ -2106,7 +2473,10 @@ export default function App() {
         <div className="fade-in">
           <SummaryBand buckets={buckets} totalHours={totalHours} burndown={world.burndowns.global} />
           <LensesRow buckets={buckets} hoursMap={hoursMap} onPick={goBucket} />
-          <CampaignTreemap buckets={buckets} hoursMap={hoursMap} onPick={goBucket} theme={route.theme} />
+          <CampaignTreemap
+            buckets={buckets} hoursMap={hoursMap} onPick={goBucket} theme={route.theme}
+            assignmentsByBucket={peopleFor}
+          />
           <Footer totalFindings={totalFindings} />
         </div>
       )}
@@ -2122,6 +2492,8 @@ export default function App() {
           setEstimates={setEstimates}
           world={world}
           burndown={world.burndowns.byBucket.get(selectedBucket.id)}
+          assignedPeople={peopleFor(selectedBucket.id)}
+          onOpenPicker={openPicker}
         />
       )}
 
@@ -2156,6 +2528,14 @@ export default function App() {
           burndown={world.burndowns.byAsset.get(metaAsset.id)}
         />
       )}
+
+      <PeoplePickerModal
+        open={!!pickerBucket}
+        bucket={pickerBucket}
+        initialSelected={pickerBucketId ? assignments[pickerBucketId] : []}
+        onClose={closePicker}
+        onApply={(ids) => applyAssignment(pickerBucketId, ids)}
+      />
     </div>
   );
 }

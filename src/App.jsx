@@ -8,7 +8,7 @@ import {
   Mail, Hash, MapPin, Tag as TagIcon, ExternalLink, Phone,
   Palette, Check, Copy, Users, UserPlus, Search,
   List, ListChecks, Plus, FilePlus,
-  Activity, Bug, ClipboardCheck, Cloud, Crosshair, Package
+  Activity, Bug, ClipboardCheck, Cloud, Crosshair, Package, Filter
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +62,16 @@ const ORG = {
 // overview. Must match an `id` in the PEOPLE roster below. To make the demo
 // feel like someone else, change this to e.g. 'sam.okafor' or 'priya.patel'.
 const CURRENT_USER_ID = 'jane.doe';
+
+// Global scale applied to every campaign's finding count. The hand-authored
+// numbers in BUCKETS_DEF were originally calibrated to ~256k total to mimic
+// a large-scale enterprise scanner inventory; for demos this number was
+// overwhelming and not useful, so we scale down to ~25k while keeping the
+// per-asset finding density (findingsPerAsset) unchanged. That means a
+// campaign that originally affected 6,000 assets with 30k findings now
+// affects 600 assets with 3k findings — same "many fixes per action" story,
+// at a digestible scale.
+const FINDINGS_SCALE = 0.1;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // THEMES  ─  registry. To add a theme: copy a block, rename the key, tweak the
@@ -288,7 +298,7 @@ const ASSESSMENT_TYPES = {
   continuous: { label: 'Continuous Scan',     short: 'Continuous', color: '#3b8c5b', icon: Activity,        desc: 'Network/host vulnerability scanning (Rapid7, Tenable, Qualys)' },
   coverity:   { label: 'Coverity (Static)',   short: 'Coverity',   color: '#8a4a98', icon: Bug,             desc: 'Static application security testing — code-level bugs' },
   config:     { label: 'Configuration Audit', short: 'Config',     color: '#a36b1d', icon: ClipboardCheck,  desc: 'Hardening / CIS benchmark compliance checks' },
-  cloud:      { label: 'Cloud Posture',       short: 'CSPM',       color: '#2f6f9e', icon: Cloud,           desc: 'Cloud misconfiguration & posture (CSPM)' },
+  cloud:      { label: 'Prisma Cloud',        short: 'Prisma',     color: '#2f6f9e', icon: Cloud,           desc: 'Cloud posture & misconfiguration (Prisma Cloud)' },
   pentest:    { label: 'Penetration Test',    short: 'Pentest',    color: '#a83253', icon: Crosshair,       desc: 'Manual red-team / penetration test findings' },
   dependency: { label: 'Dependency Scan',     short: 'Deps',       color: '#356d6b', icon: Package,         desc: 'SCA — third-party library / supply-chain' },
 };
@@ -327,11 +337,16 @@ const ASSESSMENT_MIX_BY_BUCKET = {
   'enable-mfa':          { pentest: 0.50, config: 0.30, cloud: 0.20 },
 };
 
-// Returns the proportion of this bucket's findings attributable to a given
-// assessment type. 'all' returns 1.0. Missing types return 0.
+// Returns the proportion of this bucket's findings attributable to the
+// active assessment-source filter. The filter is a Set of selected types;
+// empty set means "no filter" → 1.0. With one or more selected, return the
+// sum of the bucket's mix shares for those types.
 function bucketShare(bucket, assessment) {
-  if (!assessment || assessment === 'all') return 1;
-  return (bucket.assessmentMix && bucket.assessmentMix[assessment]) || 0;
+  if (!assessment || assessment.size === 0) return 1;
+  const mix = bucket.assessmentMix || {};
+  let s = 0;
+  assessment.forEach(k => { s += mix[k] || 0; });
+  return s;
 }
 
 const BUCKETS_DEF = [
@@ -416,7 +431,11 @@ const PEOPLE_BY_ID = new Map(PEOPLE.map(p => [p.id, p]));
 // BUILD BUCKETS — pre-computed aggregates
 // ─────────────────────────────────────────────────────────────────────────────
 function buildBuckets() {
-  return BUCKETS_DEF.map(([id, verb, noun, baseHours, count, sevMix, assetMix, findingsPerAsset]) => {
+  return BUCKETS_DEF.map(([id, verb, noun, baseHours, rawCount, sevMix, assetMix, findingsPerAsset]) => {
+    // Apply the global scale to count. findingsPerAsset stays unchanged, so
+    // affected-asset counts cascade down proportionally and per-asset
+    // finding density stays realistic.
+    const count = Math.max(1, Math.round(rawCount * FINDINGS_SCALE));
     const sevCounts = sevMix.map(p => Math.round(count * p));
     const assetCounts = assetMix.map(p => Math.round(count * p));
     const affectedAssetsByType = assetCounts.map(c => Math.max(1, Math.round(c / findingsPerAsset)));
@@ -748,7 +767,16 @@ function parseHash() {
   const themeParam = params.get('theme');
   const theme = (themeParam && THEMES[themeParam]) ? themeParam : DEFAULT_THEME;
   const assessmentParam = params.get('assessment');
-  const assessment = (assessmentParam && ASSESSMENT_TYPES[assessmentParam]) ? assessmentParam : 'all';
+  // Multi-select assessment filter — accept comma-separated list. Each entry
+  // must match a known type or it's silently dropped. Empty / missing → no
+  // filter (empty Set).
+  const assessment = new Set();
+  if (assessmentParam) {
+    assessmentParam.split(',').forEach(k => {
+      const t = k.trim();
+      if (t && ASSESSMENT_TYPES[t]) assessment.add(t);
+    });
+  }
   const onlyMine = params.get('mine') === '1';
   const parts = pathPart.split('/').filter(Boolean);
   let view = { kind: 'overview' };
@@ -782,7 +810,7 @@ function serializeHash(view, theme, assessment, onlyMine) {
   }
   const qs = [];
   if (theme && theme !== DEFAULT_THEME) qs.push(`theme=${theme}`);
-  if (assessment && assessment !== 'all') qs.push(`assessment=${assessment}`);
+  if (assessment && assessment.size > 0) qs.push(`assessment=${[...assessment].join(',')}`);
   if (onlyMine) qs.push('mine=1');
   const q = qs.length ? `?${qs.join('&')}` : '';
   return `#${path}${q}`;
@@ -967,6 +995,49 @@ function Avatar({ person, size = 28, ring = true }) {
     >
       {person.initials}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLAIM BUTTON — per (campaign, asset) marker that the current user is going
+// to work this asset. Toggles between a subtle "Claim" affordance and the
+// user's avatar circle. Stops click propagation so the row's drill-down
+// click handler doesn't fire.
+// ─────────────────────────────────────────────────────────────────────────────
+function ClaimButton({ claimed, onToggle, currentUser, sm = false }) {
+  if (!currentUser) return null;
+  const size = sm ? 18 : 22;
+  const handle = (e) => { e.stopPropagation(); onToggle(); };
+  if (claimed) {
+    return (
+      <button
+        onClick={handle}
+        title={`Claimed by ${currentUser.name} — click to release`}
+        style={{
+          background: 'transparent', border: 'none', padding: 0,
+          cursor: 'pointer', display: 'inline-flex', alignItems: 'center',
+          flexShrink: 0,
+        }}
+      >
+        <Avatar person={currentUser} size={size} ring={false} />
+      </button>
+    );
+  }
+  return (
+    <button
+      onClick={handle}
+      title="Claim this asset — mark that you'll work it"
+      className="claim-btn"
+      style={{
+        background: 'transparent', color: 'var(--text-dim)',
+        border: `1px solid var(--border)`, padding: sm ? '2px 8px' : '3px 10px',
+        fontSize: sm ? 10 : 11, fontWeight: 500, cursor: 'pointer',
+        display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0,
+        letterSpacing: '0.04em',
+      }}
+    >
+      <UserPlus size={sm ? 9 : 10} /> Claim
+    </button>
   );
 }
 
@@ -1287,25 +1358,56 @@ function AssessmentFilter({ assessment, onChange, buckets }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ASSESSMENT CHIP — slim "Filtered to: X ✕" indicator for drill-down pages.
+// Renders a single-source pill when one is selected, or a "N sources" chip
+// when two or more are selected.
 // ─────────────────────────────────────────────────────────────────────────────
 function AssessmentChip({ assessment, onClear }) {
-  if (!assessment || assessment === 'all') return null;
-  const t = ASSESSMENT_TYPES[assessment];
-  if (!t) return null;
-  const Icon = t.icon;
+  if (!assessment || assessment.size === 0) return null;
+  const keys = [...assessment];
+  if (keys.length === 1) {
+    const t = ASSESSMENT_TYPES[keys[0]];
+    if (!t) return null;
+    const Icon = t.icon;
+    return (
+      <div className="card-hover" style={{
+        display: 'inline-flex', alignItems: 'center', gap: 8, padding: '5px 10px',
+        background: 'var(--surface-2)', border: `1px solid ${t.color}`, color: t.color,
+        fontSize: 11, fontWeight: 500,
+      }}>
+        <Icon size={11} />
+        <span>Filtered: {t.label}</span>
+        <button
+          onClick={(e) => { e.stopPropagation(); onClear && onClear(); }}
+          title="Clear assessment filter"
+          style={{
+            background: 'transparent', border: 'none', color: t.color,
+            padding: 0, marginLeft: 4, display: 'flex', alignItems: 'center', cursor: 'pointer',
+          }}
+        >
+          <X size={12} />
+        </button>
+      </div>
+    );
+  }
+  // 2+ selected — show count and color-stripe
+  const colors = keys.map(k => ASSESSMENT_TYPES[k] && ASSESSMENT_TYPES[k].color).filter(Boolean);
   return (
     <div className="card-hover" style={{
-      display: 'inline-flex', alignItems: 'center', gap: 8, padding: '5px 10px 5px 10px',
-      background: 'var(--surface-2)', border: `1px solid ${t.color}`, color: t.color,
+      display: 'inline-flex', alignItems: 'center', gap: 8, padding: '5px 10px',
+      background: 'var(--surface-2)', border: `1px solid var(--accent)`, color: 'var(--accent)',
       fontSize: 11, fontWeight: 500,
     }}>
-      <Icon size={11} />
-      <span>Filtered: {t.label}</span>
+      <span style={{ display: 'inline-flex', gap: 1 }}>
+        {colors.map((c, i) => (
+          <span key={i} style={{ width: 6, height: 10, background: c, display: 'inline-block' }} />
+        ))}
+      </span>
+      <span>Filtered: {keys.length} sources</span>
       <button
         onClick={(e) => { e.stopPropagation(); onClear && onClear(); }}
         title="Clear assessment filter"
         style={{
-          background: 'transparent', border: 'none', color: t.color,
+          background: 'transparent', border: 'none', color: 'var(--accent)',
           padding: 0, marginLeft: 4, display: 'flex', alignItems: 'center', cursor: 'pointer',
         }}
       >
@@ -1341,14 +1443,20 @@ function AssessmentTag({ assessment, sm = false }) {
 // route.
 // ─────────────────────────────────────────────────────────────────────────────
 function FilteredEmptyState({ kind, label, assessment, onClearAssessment, onBack }) {
-  const t = ASSESSMENT_TYPES[assessment];
+  // Build a human label for the active filter set.
+  const keys = assessment ? [...assessment] : [];
+  const filterLabel = keys.length === 0
+    ? 'the active filter'
+    : keys.length === 1
+      ? (ASSESSMENT_TYPES[keys[0]] ? ASSESSMENT_TYPES[keys[0]].label : keys[0])
+      : `the selected ${keys.length} sources`;
   return (
     <div className="fade-in" style={{ padding: '60px 28px', textAlign: 'center' }}>
       <div className="label" style={{ marginBottom: 12, color: 'var(--text-dim)' }}>
         Nothing to show
       </div>
       <h2 className="display" style={{ fontSize: 28, fontWeight: 400, margin: '0 0 12px', color: 'var(--text)' }}>
-        This {kind}{label ? ` — ${label}` : ''} has no findings from {t ? t.label : assessment}.
+        This {kind}{label ? ` — ${label}` : ''} has no findings from {filterLabel}.
       </h2>
       <p style={{ color: 'var(--text-dim)', maxWidth: 520, margin: '0 auto 24px', fontSize: 13 }}>
         The assessment filter is hiding everything on this page. Clear it to view the campaign in full, or go back to the operations brief.
@@ -1373,7 +1481,7 @@ function FilteredEmptyState({ kind, label, assessment, onClearAssessment, onBack
 // user's avatar + name so it's clear who "you" are. Persisted in URL as
 // ?mine=1 alongside theme and assessment.
 // ─────────────────────────────────────────────────────────────────────────────
-function MyCampaignsToggle({ onlyMine, onChange, currentUser, mineCount, totalCount }) {
+function MyCampaignsToggle({ onlyMine, onChange, currentUser, mineCount, totalCount, rightSlot }) {
   if (!currentUser) return null;
   return (
     <div style={{
@@ -1402,6 +1510,7 @@ function MyCampaignsToggle({ onlyMine, onChange, currentUser, mineCount, totalCo
       }}>
         {onlyMine ? `${mineCount} of ${totalCount}` : `${totalCount} total`}
       </span>
+      {rightSlot && <span style={{ marginLeft: 'auto' }}>{rightSlot}</span>}
     </div>
   );
 }
@@ -1412,6 +1521,175 @@ function MyCampaignsToggle({ onlyMine, onChange, currentUser, mineCount, totalCo
 // to navigate. Esc dismisses. Index is built once per (world, buckets) pair
 // so typing stays snappy across 5K assets.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CREATE CAMPAIGN MODAL — visual-only modal for relaying the concept of
+// custom-defined remediation campaigns. No persistence behind it; submit
+// just closes. The dropdown of preset types maps to the verbs already used
+// in the data model so it composes cleanly if/when this is wired to real
+// campaign creation.
+// ─────────────────────────────────────────────────────────────────────────────
+const CAMPAIGN_TYPE_OPTIONS = [
+  { id: 'segment-network',     label: 'Segment Network' },
+  { id: 'retire-asset',        label: 'Retire Asset' },
+  { id: 'patch-software',      label: 'Patch Software' },
+  { id: 'upgrade-software',    label: 'Upgrade Software' },
+  { id: 'rotate-credentials',  label: 'Rotate Credentials' },
+  { id: 'configure-hardening', label: 'Configure Hardening' },
+  { id: 'enable-control',      label: 'Enable Security Control' },
+  { id: 'replace-component',   label: 'Replace Component' },
+  { id: 'audit-access',        label: 'Audit Access' },
+  { id: 'decommission-eol',    label: 'Decommission End-of-Life' },
+];
+
+function CreateCampaignModal({ open, onClose }) {
+  const [name, setName] = useState('');
+  const [type, setType] = useState('');
+  const [eta, setEta] = useState('');
+  const [comment, setComment] = useState('');
+
+  // Reset fields whenever the modal closes so the next open is clean.
+  useEffect(() => {
+    if (!open) {
+      setName(''); setType(''); setEta(''); setComment('');
+    }
+  }, [open]);
+
+  // Esc dismisses
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const inputStyle = {
+    width: '100%', background: 'var(--bg)', color: 'var(--text)',
+    border: `1px solid var(--border)`, padding: '8px 12px',
+    fontSize: 13, fontFamily: 'inherit', outline: 'none',
+    boxSizing: 'border-box',
+  };
+
+  const submit = () => {
+    // Visual only — no actual campaign creation. Close the modal.
+    onClose();
+  };
+
+  return (
+    <div onClick={onClose} className="fade-in" style={{
+      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 100, padding: 20,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: 'var(--surface)', border: `1px solid var(--border-bright)`,
+        padding: 28, width: 560, maxWidth: '100%', maxHeight: '90vh',
+        overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.25)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 18 }}>
+          <div>
+            <div className="label" style={{ marginBottom: 6, color: 'var(--accent)' }}>Create Campaign</div>
+            <div className="display" style={{ fontSize: 22, fontWeight: 500, color: 'var(--text)', lineHeight: 1.2 }}>
+              Define a new remediation effort.
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
+              A campaign groups findings under a single action. Pick a type, give it a clear name, and add notes for the team.
+            </div>
+          </div>
+          <button onClick={onClose} title="Close" style={{
+            background: 'transparent', border: 'none', color: 'var(--text-dim)',
+            padding: 4, cursor: 'pointer', display: 'flex', flexShrink: 0,
+          }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <label className="label" style={{ display: 'block', marginBottom: 6 }}>
+            Campaign Name
+          </label>
+          <input
+            type="text"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            placeholder="e.g. Segment Production VPC"
+            autoFocus
+            style={inputStyle}
+          />
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <label className="label" style={{ display: 'block', marginBottom: 6 }}>
+            Campaign Type
+          </label>
+          <div style={{ position: 'relative' }}>
+            <select
+              value={type}
+              onChange={e => setType(e.target.value)}
+              style={{ ...inputStyle, appearance: 'none', cursor: 'pointer', paddingRight: 32 }}
+            >
+              <option value="">Select a type…</option>
+              {CAMPAIGN_TYPE_OPTIONS.map(t => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+            <ChevronRight size={11} color="var(--text-dim)" style={{
+              position: 'absolute', right: 12, top: '50%',
+              transform: 'translateY(-50%) rotate(90deg)', pointerEvents: 'none',
+            }} />
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <label className="label" style={{ display: 'block', marginBottom: 6 }}>
+            Estimated Completion <span style={{ textTransform: 'none', color: 'var(--text-faint)', letterSpacing: 0, fontWeight: 400 }}>· optional</span>
+          </label>
+          <input
+            type="date"
+            value={eta}
+            onChange={e => setEta(e.target.value)}
+            style={inputStyle}
+          />
+        </div>
+
+        <div style={{ marginBottom: 22 }}>
+          <label className="label" style={{ display: 'block', marginBottom: 6 }}>
+            Comments <span style={{ textTransform: 'none', color: 'var(--text-faint)', letterSpacing: 0, fontWeight: 400 }}>· optional</span>
+          </label>
+          <textarea
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            placeholder="Context, constraints, rollout notes…"
+            rows={4}
+            style={{ ...inputStyle, resize: 'vertical', minHeight: 80 }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={{
+            background: 'transparent', color: 'var(--text)', border: `1px solid var(--border)`,
+            padding: '8px 16px', fontSize: 12, fontWeight: 500, cursor: 'pointer',
+          }}>Cancel</button>
+          <button
+            onClick={submit}
+            disabled={!name.trim() || !type}
+            style={{
+              background: (!name.trim() || !type) ? 'var(--surface-3)' : 'var(--accent)',
+              color: (!name.trim() || !type) ? 'var(--text-faint)' : '#fff',
+              border: 'none', padding: '8px 16px', fontSize: 12, fontWeight: 600,
+              cursor: (!name.trim() || !type) ? 'not-allowed' : 'pointer',
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}
+          >
+            <Plus size={13} /> Create Campaign
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function GlobalSearch({ world, buckets, onJumpAsset, onJumpCampaign }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(false);
@@ -1883,7 +2161,7 @@ function ThemePicker({ theme, onSelect }) {
   );
 }
 
-function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome, world, buckets, onJumpAsset, onJumpCampaign }) {
+function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome, world, buckets, onJumpAsset, onJumpCampaign, onOpenSources, activeSourcesCount }) {
   return (
     <header style={{
       borderBottom: `1px solid var(--border)`,
@@ -1922,6 +2200,19 @@ function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, o
           </div>
         </div>
         <ThemePicker theme={theme} onSelect={onSelectTheme} />
+        <button onClick={onOpenSources} className="card-hover" style={{
+          background: 'transparent', border: `1px solid var(--border)`, color: 'var(--text)',
+          padding: '6px 12px', display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
+          position: 'relative',
+        }}>
+          <Filter size={13} /> Sources
+          {activeSourcesCount > 0 && (
+            <span className="mono" style={{
+              background: 'var(--accent)', color: '#fff', fontSize: 9, fontWeight: 700,
+              padding: '1px 5px', minWidth: 14, textAlign: 'center', letterSpacing: '0.02em',
+            }}>{activeSourcesCount}</span>
+          )}
+        </button>
         <button onClick={onSettings} className="card-hover" style={{
           background: 'transparent', border: `1px solid var(--border)`, color: 'var(--text)',
           padding: '6px 12px', display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12,
@@ -1997,7 +2288,6 @@ function LensCard({ icon: Icon, title, tagline, items, onPick, accent }) {
       padding: 22,
       display: 'flex',
       flexDirection: 'column',
-      minHeight: 360,
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
         <Icon size={16} color={accent} strokeWidth={1.75} />
@@ -2273,7 +2563,7 @@ function BreakdownRow({ label, sub, subTip, value, total, color, valueLabel }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // BUCKET DETAIL
 // ─────────────────────────────────────────────────────────────────────────────
-function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown, assignedPeople, onOpenPicker, onFindings, assessment, onClearAssessment }) {
+function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown, assignedPeople, onOpenPicker, onFindings, assessment, onClearAssessment, currentUser, isClaimed, onToggleClaim }) {
   const [filterAsset, setFilterAsset] = useState('all');
   const [filterEnv, setFilterEnv] = useState('all');
   const [filterCrit, setFilterCrit] = useState('all');
@@ -2600,7 +2890,7 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
                   fontSize: 12, alignItems: 'center',
                 }} className="clickable">
                   <SevDot sev={a.worstSeverity} size={6} />
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, width: '100%' }}>
                     <span className="mono" style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.asset.id}</span>
                     <button
                       onClick={(e) => { e.stopPropagation(); onAssetMeta && onAssetMeta(a.assetId); }}
@@ -2609,6 +2899,14 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
                     >
                       <Info size={12} />
                     </button>
+                    <span style={{ marginLeft: 'auto' }}>
+                      <ClaimButton
+                        claimed={isClaimed && isClaimed(bucket.id, a.assetId)}
+                        onToggle={() => onToggleClaim && onToggleClaim(bucket.id, a.assetId)}
+                        currentUser={currentUser}
+                        sm
+                      />
+                    </span>
                   </div>
                   <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-dim)' }}>
                     <A.Icon size={11} strokeWidth={1.75} /> {A.label}
@@ -2643,7 +2941,7 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
 // ─────────────────────────────────────────────────────────────────────────────
 // ASSET DETAIL — third level
 // ─────────────────────────────────────────────────────────────────────────────
-function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack, onCampaign, onAsset, onAssetMeta, burndown, onFindings, assessment, onClearAssessment }) {
+function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack, onCampaign, onAsset, onAssetMeta, burndown, onFindings, assessment, onClearAssessment, currentUser, isClaimed, onToggleClaim }) {
   const asset = world.assetMap.get(assetId);
   const entries = world.assetFindings.get(assetId) || [];
 
@@ -2840,13 +3138,23 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
               fontSize: 12, alignItems: 'center',
             }}>
               <SevDot sev={e.worstSeverity} size={7} />
-              <div>
-                <div style={{ fontWeight: 500, color: 'var(--text)' }}>
-                  <span style={{ color: 'var(--text-dim)' }}>{e.bucket.verb}</span> {e.bucket.noun}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 500, color: 'var(--text)' }}>
+                    <span style={{ color: 'var(--text-dim)' }}>{e.bucket.verb}</span> {e.bucket.noun}
+                  </div>
+                  <div className="mono" style={{ fontSize: 10, color: 'var(--text-faint)', marginTop: 2 }}>
+                    base {(estimates[e.bucket.id] ?? e.bucket.baseHours)}h
+                  </div>
                 </div>
-                <div className="mono" style={{ fontSize: 10, color: 'var(--text-faint)', marginTop: 2 }}>
-                  base {(estimates[e.bucket.id] ?? e.bucket.baseHours)}h
-                </div>
+                <span style={{ marginLeft: 'auto' }}>
+                  <ClaimButton
+                    claimed={isClaimed && isClaimed(e.bucketId, assetId)}
+                    onToggle={() => onToggleClaim && onToggleClaim(e.bucketId, assetId)}
+                    currentUser={currentUser}
+                    sm
+                  />
+                </span>
               </div>
               <span className="mono" style={{ color: 'var(--text)', fontVariantNumeric: 'tabular-nums' }}>{e.findingsCount}</span>
               <SeverityBar counts={e.sevCounts} height={5} />
@@ -2948,8 +3256,8 @@ function FindingsView({ bucket, asset, world, onBack, onCampaign, onAsset, onAss
       const fs = materializeFindings(e, a, bucket);
       fs.forEach(f => all.push({ ...f, asset: a }));
     });
-    if (assessment && assessment !== 'all') {
-      return all.filter(f => f.assessment === assessment);
+    if (assessment && assessment.size > 0) {
+      return all.filter(f => assessment.has(f.assessment));
     }
     return all;
   }, [bucket, asset, world, assessment]);
@@ -3022,7 +3330,10 @@ function FindingsView({ bucket, asset, world, onBack, onCampaign, onAsset, onAss
   // Three grid templates — Asset col toggles when scoped to one asset, and
   // Assessment col is hidden when global assessment filter is locked to one
   // type (since every visible row would have the same value).
-  const showAssessmentCol = !assessment || assessment === 'all';
+  // Hide the Source column when there's exactly one source selected (every
+  // visible row would show the same value). Show otherwise — including with
+  // 2+ sources selected, where rows can vary.
+  const showAssessmentCol = !assessment || assessment.size !== 1;
   const cols = (() => {
     // checkbox · sevDot · finding · cve · [asset] · kev · poc · priority · firstFound · age · sla · [assessment] · status
     const parts = ['24px', '16px', '1.4fr', '1.1fr'];
@@ -3284,6 +3595,144 @@ function FindingsView({ bucket, asset, world, onBack, onCampaign, onAsset, onAss
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ASSESSMENT FILTER PANEL — slide-in flyout for multi-selecting which scanner
+// sources should drive the data shown in the rest of the UI. Empty selection
+// = no filter. Changes apply live as the user toggles checkboxes; Done just
+// dismisses. Modeled on EstimatesPanel for visual consistency.
+// ─────────────────────────────────────────────────────────────────────────────
+function AssessmentFilterPanel({ open, onClose, assessment, onChange, buckets }) {
+  // Live counts per type so the user can see how big each source is before
+  // toggling. Computed against the unfiltered bucket list.
+  const counts = useMemo(() => {
+    const m = { all: 0 };
+    ASSESSMENT_KEYS.forEach(k => { m[k] = 0; });
+    buckets.forEach(b => {
+      m.all += b.count;
+      ASSESSMENT_KEYS.forEach(k => {
+        m[k] += b.count * (b.assessmentMix[k] || 0);
+      });
+    });
+    return m;
+  }, [buckets]);
+
+  const toggle = (k) => {
+    const next = new Set(assessment);
+    if (next.has(k)) next.delete(k); else next.add(k);
+    onChange(next);
+  };
+  const selectAll = () => onChange(new Set(ASSESSMENT_KEYS));
+  const clearAll  = () => onChange(new Set());
+
+  const activeCount = assessment ? assessment.size : 0;
+  const filteredTotal = useMemo(() => {
+    if (!assessment || assessment.size === 0) return counts.all;
+    let t = 0;
+    assessment.forEach(k => { t += counts[k] || 0; });
+    return t;
+  }, [counts, assessment]);
+
+  if (!open) return null;
+  return (
+    <>
+      <div onClick={onClose} className="fade-in" style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 50,
+      }}/>
+      <aside className="slide-in" style={{
+        position: 'fixed', top: 0, right: 0, bottom: 0, width: 460,
+        background: 'var(--surface)', borderLeft: `1px solid var(--border-bright)`, zIndex: 51,
+        display: 'flex', flexDirection: 'column',
+      }}>
+        <div style={{ padding: '20px 24px', borderBottom: `1px solid var(--border)`, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div>
+            <div className="label" style={{ marginBottom: 4 }}>Filter</div>
+            <div className="display" style={{ fontSize: 22, fontWeight: 400 }}>Assessment Sources</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', padding: 4, cursor: 'pointer' }}>
+            <X size={18}/>
+          </button>
+        </div>
+
+        <div style={{ padding: '18px 24px', borderBottom: `1px solid var(--border)`, background: 'var(--surface-2)' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+            <div>
+              <div className="label" style={{ marginBottom: 4 }}>Selected</div>
+              <div className="mono display" style={{ fontSize: 22, color: activeCount > 0 ? 'var(--accent)' : 'var(--text-dim)' }}>
+                {activeCount === 0 ? 'All' : `${activeCount} of ${ASSESSMENT_KEYS.length}`}
+              </div>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 4 }}>Findings shown</div>
+              <div className="mono display" style={{ fontSize: 22, color: 'var(--text)' }}>
+                {fmtNum(Math.round(filteredTotal))}
+              </div>
+            </div>
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10, lineHeight: 1.5 }}>
+            Pick one or more scanner sources. Empty selection means no filter — every source contributes.
+          </div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            <button onClick={selectAll} style={{
+              background: 'transparent', border: `1px solid var(--border)`, color: 'var(--text)',
+              padding: '4px 10px', fontSize: 11, cursor: 'pointer',
+            }}>Select all</button>
+            <button onClick={clearAll} disabled={activeCount === 0} style={{
+              background: 'transparent', border: `1px solid var(--border)`,
+              color: activeCount === 0 ? 'var(--text-faint)' : 'var(--text)',
+              padding: '4px 10px', fontSize: 11,
+              cursor: activeCount === 0 ? 'not-allowed' : 'pointer',
+            }}>Clear all</button>
+          </div>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
+          {ASSESSMENT_KEYS.map(k => {
+            const t = ASSESSMENT_TYPES[k];
+            const Icon = t.icon;
+            const checked = assessment && assessment.has(k);
+            const count = counts[k] || 0;
+            return (
+              <label key={k} className="card-hover" style={{
+                display: 'grid', gridTemplateColumns: '20px 28px 1fr auto',
+                alignItems: 'center', gap: 12, padding: '12px 24px',
+                borderBottom: `1px solid var(--border)`, cursor: 'pointer',
+                background: checked ? 'var(--surface-2)' : 'transparent',
+              }}>
+                <input
+                  type="checkbox"
+                  checked={!!checked}
+                  onChange={() => toggle(k)}
+                  style={{ accentColor: t.color, cursor: 'pointer', width: 14, height: 14 }}
+                />
+                <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', color: t.color }}>
+                  <Icon size={18} />
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 13, color: 'var(--text)', fontWeight: 500 }}>{t.label}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>{t.desc}</div>
+                </div>
+                <span className="mono" style={{
+                  fontSize: 11, color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums',
+                  whiteSpace: 'nowrap',
+                }}>
+                  {fmtNum(Math.round(count))}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        <div style={{ padding: '14px 24px', borderTop: `1px solid var(--border)`, display: 'flex', justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={{
+            background: 'var(--accent)', color: '#fff', border: 'none',
+            padding: '8px 18px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+          }}>Done</button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ESTIMATES PANEL
 // ─────────────────────────────────────────────────────────────────────────────
 function EstimatesPanel({ open, onClose, buckets, estimates, setEstimates, baseTotalHours }) {
@@ -3446,6 +3895,27 @@ export default function App() {
   }));
   const [pickerBucketId, setPickerBucketId] = useState(null);
 
+  // Asset claims — Set<`${bucketId}:${assetId}`> of (campaign × asset) pairs
+  // the current user has personally claimed responsibility for. Lives in
+  // memory only; no persistence. Used purely as a visual "in work" marker
+  // on the asset rows in BucketDetail and AssetDetail.
+  const [claims, setClaims] = useState(() => new Set());
+  const toggleClaim = useCallback((bucketId, assetId) => {
+    setClaims(prev => {
+      const next = new Set(prev);
+      const key = `${bucketId}:${assetId}`;
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }, []);
+  const isClaimed = useCallback((bucketId, assetId) => claims.has(`${bucketId}:${assetId}`), [claims]);
+
+  // Create-campaign modal state — visual only; no actual creation behavior.
+  const [showCreateCampaign, setShowCreateCampaign] = useState(false);
+
+  // Assessment-source filter flyout open/close
+  const [showAssessmentFilter, setShowAssessmentFilter] = useState(false);
+
   // Apply theme to root via setProperty — supports any theme key in THEMES.
   useEffect(() => {
     applyThemeVars(route.theme);
@@ -3457,7 +3927,7 @@ export default function App() {
     return m;
   }, [buckets, estimates]);
 
-  const assessment = route.assessment || 'all';
+  const assessment = route.assessment || new Set();
 
   // Display data — buckets, hours map, and per-asset entries scaled by each
   // bucket's share of the active assessment filter. Buckets with zero share of
@@ -3465,7 +3935,7 @@ export default function App() {
   // overview totals match the active filter. The original `buckets`/`world`
   // are still available for any view that needs the unfiltered data.
   const displayBuckets = useMemo(() => {
-    if (assessment === 'all') return buckets;
+    if (assessment.size === 0) return buckets;
     return buckets
       .map(b => {
         const s = bucketShare(b, assessment);
@@ -3493,7 +3963,7 @@ export default function App() {
   }, [buckets, assessment]);
 
   const displayHoursMap = useMemo(() => {
-    if (assessment === 'all') return hoursMap;
+    if (assessment.size === 0) return hoursMap;
     const m = {};
     displayBuckets.forEach(b => { m[b.id] = (hoursMap[b.id] || 0) * b._share; });
     return m;
@@ -3502,7 +3972,7 @@ export default function App() {
   // Scale per-asset entries inside world.bucketAssets so per-bucket asset
   // tables and per-asset campaign tables reflect the filter too.
   const displayWorld = useMemo(() => {
-    if (assessment === 'all') return world;
+    if (assessment.size === 0) return world;
     const newBucketAssets = new Map();
     const newAssetFindings = new Map();
     buckets.forEach(b => {
@@ -3528,19 +3998,21 @@ export default function App() {
       });
     });
     // Burndown — scale uniformly by the global share across all buckets so the
-    // trend chart visually reflects the filter while staying smooth.
+    // trend chart visually reflects the filter while staying smooth. Each
+    // series is a flat array of numbers (one per day), not objects.
     const totalCount = buckets.reduce((acc, b) => acc + b.count, 0);
     const filteredCount = buckets.reduce((acc, b) => acc + b.count * bucketShare(b, assessment), 0);
     const globalScale = totalCount > 0 ? filteredCount / totalCount : 0;
-    const scaleSeries = (s) => s ? s.map(p => ({ ...p, value: Math.round(p.value * globalScale) })) : s;
+    const scaleSeries = (s) => s ? s.map(v => Math.round(v * globalScale)) : s;
     const newBurndowns = {
       global: scaleSeries(world.burndowns.global),
       byBucket: new Map([...world.burndowns.byBucket.entries()].map(([bid, series]) => {
-        const sc = bucketShare(buckets.find(b => b.id === bid), assessment);
-        return [bid, series.map(p => ({ ...p, value: Math.round(p.value * sc) }))];
+        const b = buckets.find(b => b.id === bid);
+        const sc = b ? bucketShare(b, assessment) : 0;
+        return [bid, series.map(v => Math.round(v * sc))];
       })),
       byAsset: new Map([...world.burndowns.byAsset.entries()].map(([aid, series]) => {
-        return [aid, series.map(p => ({ ...p, value: Math.round(p.value * globalScale) }))];
+        return [aid, series.map(v => Math.round(v * globalScale))];
       })),
     };
     return {
@@ -3630,11 +4102,12 @@ export default function App() {
           if (bid) goAsset(aid, bid);
         }}
         onJumpCampaign={(bid) => goBucket(bid)}
+        onOpenSources={() => setShowAssessmentFilter(true)}
+        activeSourcesCount={assessment.size}
       />
 
       {route.kind === 'overview' && (
         <div className="fade-in">
-          <AssessmentFilter assessment={assessment} onChange={setAssessment} buckets={buckets} />
           <SummaryBand buckets={displayBuckets} totalHours={totalHours} burndown={displayWorld.burndowns.global} assessment={assessment} />
           <LensesRow buckets={displayBuckets} hoursMap={displayHoursMap} onPick={goBucket} />
           <MyCampaignsToggle
@@ -3643,6 +4116,19 @@ export default function App() {
             currentUser={currentUser}
             mineCount={myCampaignsCount}
             totalCount={displayBuckets.length}
+            rightSlot={
+              <button
+                onClick={() => setShowCreateCampaign(true)}
+                className="card-hover"
+                style={{
+                  background: 'var(--accent)', color: '#fff', border: 'none',
+                  padding: '7px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                }}
+              >
+                <Plus size={13} /> Create Campaign
+              </button>
+            }
           />
           <CampaignTreemap
             buckets={treemapBuckets} hoursMap={displayHoursMap} onPick={goBucket} theme={route.theme}
@@ -3668,14 +4154,17 @@ export default function App() {
             assignedPeople={peopleFor(selectedBucket.id)}
             onOpenPicker={openPicker}
             assessment={assessment}
-            onClearAssessment={() => setAssessment('all')}
+            onClearAssessment={() => setAssessment(new Set())}
+            currentUser={currentUser}
+            isClaimed={isClaimed}
+            onToggleClaim={toggleClaim}
           />
         ) : (
           <FilteredEmptyState
             kind="campaign"
             label={selectedBucketRaw ? `${selectedBucketRaw.verb} ${selectedBucketRaw.noun}` : ''}
             assessment={assessment}
-            onClearAssessment={() => setAssessment('all')}
+            onClearAssessment={() => setAssessment(new Set())}
             onBack={goOverview}
           />
         )
@@ -3695,7 +4184,10 @@ export default function App() {
           onFindings={(bucketId) => goFindings(bucketId, route.assetId)}
           burndown={displayWorld.burndowns.byAsset.get(route.assetId)}
           assessment={assessment}
-          onClearAssessment={() => setAssessment('all')}
+          onClearAssessment={() => setAssessment(new Set())}
+          currentUser={currentUser}
+          isClaimed={isClaimed}
+          onToggleClaim={toggleClaim}
         />
       )}
 
@@ -3709,7 +4201,7 @@ export default function App() {
           onAsset={(aid) => goAsset(aid, selectedBucketRaw.id)}
           onAssetMeta={openMeta}
           assessment={assessment}
-          onClearAssessment={() => setAssessment('all')}
+          onClearAssessment={() => setAssessment(new Set())}
         />
       )}
 
@@ -3736,6 +4228,19 @@ export default function App() {
         initialSelected={pickerBucketId ? assignments[pickerBucketId] : []}
         onClose={closePicker}
         onApply={(ids) => applyAssignment(pickerBucketId, ids)}
+      />
+
+      <CreateCampaignModal
+        open={showCreateCampaign}
+        onClose={() => setShowCreateCampaign(false)}
+      />
+
+      <AssessmentFilterPanel
+        open={showAssessmentFilter}
+        onClose={() => setShowAssessmentFilter(false)}
+        assessment={assessment}
+        onChange={setAssessment}
+        buckets={buckets}
       />
     </div>
   );

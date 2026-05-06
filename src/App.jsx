@@ -6,7 +6,9 @@ import {
   Sun, Moon, Crown, Star, Circle, User, Link2,
   Wrench, Calendar, AlertCircle, Clock, TrendingDown, Info,
   Mail, Hash, MapPin, Tag as TagIcon, ExternalLink, Phone,
-  Palette, Check, Copy, Users, UserPlus, Search
+  Palette, Check, Copy, Users, UserPlus, Search,
+  List, ListChecks, Plus, FilePlus,
+  Activity, Bug, ClipboardCheck, Cloud, Crosshair, Package
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,7 +209,7 @@ const APPROACHING_THRESHOLD = 0.8;  // within 80% of SLA = "approaching"
 
 function slaStatus(sevIdx, ageDays) {
   const limit = SLA_DAYS[sevIdx];
-  if (ageDays > limit) return 'breached';
+  if (ageDays > limit) return 'overdue';
   if (ageDays > limit * APPROACHING_THRESHOLD) return 'approaching';
   return 'ok';
 }
@@ -219,7 +221,7 @@ function generateAge(sevIdx, rng) {
   if (sevIdx === 0) {
     // critical, SLA 3d
     if (r < 0.70) return Math.floor(rng() * 3);              // in SLA
-    if (r < 0.92) return 3 + Math.floor(rng() * 12);         // 3-14d breached
+    if (r < 0.92) return 3 + Math.floor(rng() * 12);         // 3-14d overdue
     if (r < 0.99) return 15 + Math.floor(rng() * 45);        // 15-59d
     return 60 + Math.floor(rng() * 90);                       // 60+d very bad
   }
@@ -227,7 +229,7 @@ function generateAge(sevIdx, rng) {
     // high, SLA 90d
     if (r < 0.72) return Math.floor(rng() * 70);             // safely in SLA
     if (r < 0.85) return 70 + Math.floor(rng() * 22);        // approaching
-    if (r < 0.96) return 92 + Math.floor(rng() * 60);        // 92-151d breached
+    if (r < 0.96) return 92 + Math.floor(rng() * 60);        // 92-151d overdue
     return 152 + Math.floor(rng() * 200);
   }
   if (sevIdx === 2) {
@@ -243,8 +245,8 @@ function generateAge(sevIdx, rng) {
   return 380 + Math.floor(rng() * 300);
 }
 
-// estimated bucket-level breach counts using the same generator distribution
-const BREACH_RATE      = [0.30, 0.28, 0.22, 0.15];  // ~ probability a finding is past SLA
+// estimated bucket-level overdue counts using the same generator distribution
+const OVERDUE_RATE      = [0.30, 0.28, 0.22, 0.15];  // ~ probability a finding is past SLA
 const APPROACHING_RATE = [0.00, 0.13, 0.12, 0.10];  // critical SLA is so short there's no "approaching"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +272,63 @@ function generateBurndown(currentCount, days, seed) {
 
 // Verb-noun campaign definitions. Columns:
 // [id, verb, noun, baseHours, count, sevMix C/H/M/L, assetMix s/db/a/ctr, findingsPerAsset]
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSESSMENT TYPES — the source/scanner each finding came from
+// ─────────────────────────────────────────────────────────────────────────────
+// Each campaign has a mix of assessment types — most campaigns lean toward one
+// dominant scanner but often have a secondary source (e.g. Log4j shows up in
+// continuous scans AND dependency/SCA scans; TLS issues show up in config
+// audits AND cloud posture). The mix sums to 1.0 per campaign.
+const ASSESSMENT_TYPES = {
+  continuous: { label: 'Continuous Scan',     short: 'Continuous', color: '#3b8c5b', icon: Activity,        desc: 'Network/host vulnerability scanning (Rapid7, Tenable, Qualys)' },
+  coverity:   { label: 'Coverity (Static)',   short: 'Coverity',   color: '#8a4a98', icon: Bug,             desc: 'Static application security testing — code-level bugs' },
+  config:     { label: 'Configuration Audit', short: 'Config',     color: '#a36b1d', icon: ClipboardCheck,  desc: 'Hardening / CIS benchmark compliance checks' },
+  cloud:      { label: 'Cloud Posture',       short: 'CSPM',       color: '#2f6f9e', icon: Cloud,           desc: 'Cloud misconfiguration & posture (CSPM)' },
+  pentest:    { label: 'Penetration Test',    short: 'Pentest',    color: '#a83253', icon: Crosshair,       desc: 'Manual red-team / penetration test findings' },
+  dependency: { label: 'Dependency Scan',     short: 'Deps',       color: '#356d6b', icon: Package,         desc: 'SCA — third-party library / supply-chain' },
+};
+const ASSESSMENT_KEYS = Object.keys(ASSESSMENT_TYPES);
+
+// Per-campaign mix. Each row sums to 1.0. Authored by hand to be plausible:
+// runtime upgrades (Java/Node/Python) carry meaningful Coverity share because
+// SAST often catches related code-level bugs alongside the runtime CVE; TLS,
+// MFA and rotation campaigns lean config + pentest; cloud-adjacent campaigns
+// pick up CSPM share.
+const ASSESSMENT_MIX_BY_BUCKET = {
+  'patch-log4j':         { continuous: 0.50, dependency: 0.45, coverity: 0.05 },
+  'upgrade-openssl':     { continuous: 0.65, dependency: 0.30, coverity: 0.05 },
+  'patch-apache':        { continuous: 0.75, config: 0.20, pentest: 0.05 },
+  'upgrade-java':        { continuous: 0.30, dependency: 0.30, coverity: 0.40 },
+  'upgrade-ubuntu':      { continuous: 0.85, config: 0.15 },
+  'patch-kernel':        { continuous: 0.95, config: 0.05 },
+  'upgrade-node':        { continuous: 0.25, dependency: 0.40, coverity: 0.35 },
+  'upgrade-postgres':    { continuous: 0.50, config: 0.35, dependency: 0.10, pentest: 0.05 },
+  'patch-nginx':         { continuous: 0.80, config: 0.15, pentest: 0.05 },
+  'upgrade-rhel':        { continuous: 0.92, config: 0.08 },
+  'upgrade-python':      { continuous: 0.30, dependency: 0.35, coverity: 0.35 },
+  'upgrade-windows':     { continuous: 0.85, config: 0.10, pentest: 0.05 },
+  'upgrade-mysql':       { continuous: 0.50, config: 0.35, dependency: 0.10, pentest: 0.05 },
+  'rotate-ssh':          { pentest: 0.50, config: 0.40, continuous: 0.10 },
+  'patch-docker':        { continuous: 0.55, config: 0.25, dependency: 0.10, cloud: 0.10 },
+  'configure-tls':       { config: 0.45, cloud: 0.35, continuous: 0.20 },
+  'replace-certs':       { continuous: 0.40, config: 0.30, cloud: 0.30 },
+  'upgrade-mongo':       { continuous: 0.50, config: 0.35, dependency: 0.10, pentest: 0.05 },
+  'upgrade-k8s':         { cloud: 0.45, continuous: 0.30, config: 0.25 },
+  'patch-jenkins':       { continuous: 0.45, dependency: 0.25, config: 0.20, pentest: 0.10 },
+  'upgrade-redis':       { continuous: 0.55, config: 0.35, dependency: 0.10 },
+  'disable-tls10':       { config: 0.45, cloud: 0.30, continuous: 0.25 },
+  'patch-elasticsearch': { continuous: 0.55, config: 0.25, dependency: 0.15, pentest: 0.05 },
+  'decommission-eol':    { pentest: 0.40, continuous: 0.35, config: 0.25 },
+  'enable-mfa':          { pentest: 0.50, config: 0.30, cloud: 0.20 },
+};
+
+// Returns the proportion of this bucket's findings attributable to a given
+// assessment type. 'all' returns 1.0. Missing types return 0.
+function bucketShare(bucket, assessment) {
+  if (!assessment || assessment === 'all') return 1;
+  return (bucket.assessmentMix && bucket.assessmentMix[assessment]) || 0;
+}
+
 const BUCKETS_DEF = [
   ['patch-log4j',         'Patch',     'Log4j Library',          0.5, 47200, [0.52, 0.32, 0.13, 0.03], [0.35, 0.05, 0.45, 0.15], 7],
   ['upgrade-openssl',     'Upgrade',   'OpenSSL',                1.0, 33800, [0.28, 0.42, 0.22, 0.08], [0.55, 0.10, 0.20, 0.15], 5],
@@ -360,18 +419,19 @@ function buildBuckets() {
     // severity-weighted risk (CVSS-ish)
     const riskScore = sevCounts[0] * 10 + sevCounts[1] * 7.5 + sevCounts[2] * 5 + sevCounts[3] * 2;
     // SLA aggregates
-    const breachedBySev = sevCounts.map((c, i) => Math.round(c * BREACH_RATE[i]));
+    const overdueBySev = sevCounts.map((c, i) => Math.round(c * OVERDUE_RATE[i]));
     const approachingBySev = sevCounts.map((c, i) => Math.round(c * APPROACHING_RATE[i]));
-    const breachedTotal = breachedBySev.reduce((a, b) => a + b, 0);
+    const overdueTotal = overdueBySev.reduce((a, b) => a + b, 0);
     const approachingTotal = approachingBySev.reduce((a, b) => a + b, 0);
     // weighted "policy pressure" — how badly out-of-policy this campaign is
-    const policyPressure = breachedBySev[0] * 10 + breachedBySev[1] * 4 + breachedBySev[2] * 1.5 + breachedBySev[3] * 0.5;
+    const policyPressure = overdueBySev[0] * 10 + overdueBySev[1] * 4 + overdueBySev[2] * 1.5 + overdueBySev[3] * 0.5;
     return {
       id, verb, noun, baseHours, count, findingsPerAsset,
       sevCounts, assetCounts, affectedAssetsByType, affectedAssets,
       riskScore,
-      breachedBySev, approachingBySev, breachedTotal, approachingTotal, policyPressure,
+      overdueBySev, approachingBySev, overdueTotal, approachingTotal, policyPressure,
       assetMix: Object.fromEntries(ASSET_TYPE_KEYS.map((k, i) => [k, assetCounts[i]])),
+      assessmentMix: ASSESSMENT_MIX_BY_BUCKET[id] || {},
     };
   });
 }
@@ -499,7 +559,7 @@ function buildAssetWorld(buckets) {
         ages.push(generateAge(s, bRng));
       }
       const sevCounts = [0, 0, 0, 0];
-      const breachedBySev = [0, 0, 0, 0];
+      const overdueBySev = [0, 0, 0, 0];
       const approachingBySev = [0, 0, 0, 0];
       let oldestAge = 0;
       sevs.forEach((s, idx) => {
@@ -507,10 +567,10 @@ function buildAssetWorld(buckets) {
         const age = ages[idx];
         if (age > oldestAge) oldestAge = age;
         const status = slaStatus(s, age);
-        if (status === 'breached') breachedBySev[s]++;
+        if (status === 'overdue') overdueBySev[s]++;
         else if (status === 'approaching') approachingBySev[s]++;
       });
-      const breachedTotal = breachedBySev.reduce((x, y) => x + y, 0);
+      const overdueTotal = overdueBySev.reduce((x, y) => x + y, 0);
       const approachingTotal = approachingBySev.reduce((x, y) => x + y, 0);
       const worstSeverity = Math.min(...sevs);
       const cve = `CVE-202${4 + Math.floor(bRng() * 2)}-${(10000 + Math.floor(bRng() * 89999)).toString()}`;
@@ -518,8 +578,8 @@ function buildAssetWorld(buckets) {
       const entry = {
         assetId: a.id, bucketId: b.id,
         findingsCount: findingsHere,
-        sevCounts, ages,
-        breachedBySev, approachingBySev, breachedTotal, approachingTotal, oldestAge,
+        sevCounts, sevs, ages,
+        overdueBySev, approachingBySev, overdueTotal, approachingTotal, oldestAge,
         worstSeverity, cve, lastSeen,
       };
       list.push(entry);
@@ -560,6 +620,102 @@ function assetHours(asset, entries, buckets, estimates) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FINDINGS — expand (asset, bucket) entries into individual finding records
+// ─────────────────────────────────────────────────────────────────────────────
+// KEV (CISA Known Exploited Vulnerability) and POC (public proof-of-concept)
+// probabilities by severity index. KEV implies POC.
+const KEV_RATE = [0.22, 0.08, 0.02, 0.005];
+const POC_RATE = [0.35, 0.18, 0.07, 0.02];
+// Workflow status distribution. Most findings are Open.
+const STATUS_OPTS = [
+  ['Open',         0.90],
+  ['In Progress',  0.05],
+  ['Risk Accepted',0.03],
+  ['Fixed',        0.01],
+  ['False Positive',0.01],
+];
+const TODAY_MS = Date.now();
+
+function materializeFindings(entry, asset, bucket) {
+  // Deterministic per (bucketId, assetId): same finding always renders the same.
+  const rng = makeRng(hashStr(entry.bucketId + ':' + entry.assetId) + 7);
+  const out = [];
+  const sevBase = [2400, 1500, 700, 200];
+  const critMult = asset.criticality === 'T1' ? 1.15 : asset.criticality === 'T2' ? 1.00 : 0.90;
+  const envMult  = asset.env === 'Production' ? 1.10 : asset.env === 'Staging' ? 1.00 : 0.90;
+
+  // Pre-compute cumulative assessment-mix table so each finding can pick its
+  // source deterministically using one rng draw.
+  const mix = bucket.assessmentMix || {};
+  const assessmentTable = [];
+  let cum = 0;
+  ASSESSMENT_KEYS.forEach(k => {
+    const p = mix[k] || 0;
+    if (p > 0) { cum += p; assessmentTable.push([k, cum]); }
+  });
+  if (assessmentTable.length === 0) assessmentTable.push(['continuous', 1]); // safety
+
+  for (let i = 0; i < entry.findingsCount; i++) {
+    const sev = entry.sevs[i];
+    const age = entry.ages[i];
+    const status = slaStatus(sev, age);
+
+    // KEV / POC — KEV implies POC
+    const kev = rng() < KEV_RATE[sev];
+    const poc = kev ? true : rng() < POC_RATE[sev];
+
+    // Priority score (0..4000-ish)
+    const kevBonus = kev ? (800 + rng() * 400) : 0;
+    const pocBonus = poc && !kev ? (200 + rng() * 200) : 0;
+    const noise = (rng() - 0.5) * 200;
+    const raw = (sevBase[sev] + kevBonus + pocBonus) * critMult * envMult + noise;
+    const priorityScore = Math.max(0, Math.min(4000, Math.round(raw)));
+
+    // First found = today minus age days
+    const firstFound = new Date(TODAY_MS - age * 86400000).toISOString().slice(0, 10);
+
+    // CVE: synthesize per-finding (loosely related to entry.cve year).
+    const year = 2020 + Math.floor(rng() * 6);
+    const cve = `CVE-${year}-${(10000 + Math.floor(rng() * 89999)).toString()}`;
+
+    // Workflow status — weighted pick
+    const r = rng();
+    let acc = 0;
+    let workflowStatus = 'Open';
+    for (const [label, p] of STATUS_OPTS) {
+      acc += p;
+      if (r < acc) { workflowStatus = label; break; }
+    }
+
+    // Assessment type — pick from the campaign's mix
+    const ar = rng();
+    let assessment = assessmentTable[assessmentTable.length - 1][0];
+    for (const [k, c] of assessmentTable) {
+      if (ar < c) { assessment = k; break; }
+    }
+
+    // Finding id — deterministic, short, scannable
+    const id = `F-${bucket.id.slice(0, 4).toUpperCase()}-${entry.assetId.slice(-4)}-${(i + 1).toString().padStart(3, '0')}`;
+
+    out.push({
+      id,
+      bucketId: entry.bucketId,
+      assetId:  entry.assetId,
+      severity: sev,
+      age,
+      slaState: status, // 'ok' | 'approaching' | 'overdue'
+      cve,
+      kev, poc,
+      priorityScore,
+      firstFound,
+      workflowStatus,
+      assessment,
+    });
+  }
+  return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FORMAT
 // ─────────────────────────────────────────────────────────────────────────────
 const fmtNum = (n) => Math.round(n).toLocaleString('en-US');
@@ -577,7 +733,8 @@ const fmtHoursDetail = (h) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HASH ROUTING — #/ , #/c/{bucketId} , #/c/{bucketId}/a/{assetId}  (?theme=dark)
+// HASH ROUTING — #/, #/c/{bucketId}, #/c/{bucketId}/findings,
+//   #/c/{bucketId}/a/{assetId}, #/c/{bucketId}/a/{assetId}/findings  (?theme=dark)
 // ─────────────────────────────────────────────────────────────────────────────
 function parseHash() {
   const raw = (typeof window !== 'undefined' ? window.location.hash : '').slice(1) || '/';
@@ -585,20 +742,42 @@ function parseHash() {
   const params = new URLSearchParams(queryPart || '');
   const themeParam = params.get('theme');
   const theme = (themeParam && THEMES[themeParam]) ? themeParam : DEFAULT_THEME;
+  const assessmentParam = params.get('assessment');
+  const assessment = (assessmentParam && ASSESSMENT_TYPES[assessmentParam]) ? assessmentParam : 'all';
   const parts = pathPart.split('/').filter(Boolean);
   let view = { kind: 'overview' };
-  if (parts[0] === 'c' && parts[1] && parts[2] === 'a' && parts[3]) {
+  // /c/{bucket}/a/{asset}/findings
+  if (parts[0] === 'c' && parts[1] && parts[2] === 'a' && parts[3] && parts[parts.length - 1] === 'findings') {
+    view = {
+      kind: 'findings',
+      bucketId: parts[1],
+      assetId: decodeURIComponent(parts.slice(3, parts.length - 1).join('/')),
+    };
+  // /c/{bucket}/findings
+  } else if (parts[0] === 'c' && parts[1] && parts[2] === 'findings') {
+    view = { kind: 'findings', bucketId: parts[1], assetId: null };
+  // /c/{bucket}/a/{asset}
+  } else if (parts[0] === 'c' && parts[1] && parts[2] === 'a' && parts[3]) {
     view = { kind: 'asset', bucketId: parts[1], assetId: decodeURIComponent(parts.slice(3).join('/')) };
+  // /c/{bucket}
   } else if (parts[0] === 'c' && parts[1]) {
     view = { kind: 'bucket', bucketId: parts[1] };
   }
-  return { ...view, theme };
+  return { ...view, theme, assessment };
 }
-function serializeHash(view, theme) {
+function serializeHash(view, theme, assessment) {
   let path = '/';
   if (view.kind === 'bucket') path = `/c/${view.bucketId}`;
   else if (view.kind === 'asset') path = `/c/${view.bucketId}/a/${encodeURIComponent(view.assetId)}`;
-  const q = (theme && theme !== DEFAULT_THEME) ? `?theme=${theme}` : '';
+  else if (view.kind === 'findings') {
+    path = view.assetId
+      ? `/c/${view.bucketId}/a/${encodeURIComponent(view.assetId)}/findings`
+      : `/c/${view.bucketId}/findings`;
+  }
+  const qs = [];
+  if (theme && theme !== DEFAULT_THEME) qs.push(`theme=${theme}`);
+  if (assessment && assessment !== 'all') qs.push(`assessment=${assessment}`);
+  const q = qs.length ? `?${qs.join('&')}` : '';
   return `#${path}${q}`;
 }
 function useRoute() {
@@ -612,14 +791,15 @@ function useRoute() {
       window.removeEventListener('popstate', onHash);
     };
   }, []);
-  const navigate = useCallback((nextView, nextTheme) => {
+  const navigate = useCallback((nextView, nextTheme, nextAssessment) => {
     const view = nextView ?? { kind: state.kind, bucketId: state.bucketId, assetId: state.assetId };
     const theme = nextTheme ?? state.theme;
-    const h = serializeHash(view, theme);
+    const assessment = nextAssessment ?? state.assessment;
+    const h = serializeHash(view, theme, assessment);
     if (window.location.hash !== h) {
       window.location.hash = h; // triggers hashchange → setState
     } else {
-      setState({ ...view, theme });
+      setState({ ...view, theme, assessment });
     }
   }, [state]);
   return [state, navigate];
@@ -1035,6 +1215,151 @@ function FilterSelect({ value, onChange, options, w = 140 }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ASSESSMENT FILTER — top-level pill row that scopes everything below it to
+// findings from a single source/scanner. Sits above the summary band on the
+// overview. The filter persists in the URL (?assessment=coverity) and
+// propagates through every drill-down.
+// ─────────────────────────────────────────────────────────────────────────────
+function AssessmentFilter({ assessment, onChange, buckets }) {
+  // Total finding count per assessment type — used as a small subtitle on each
+  // pill so the user can tell at a glance which sources have the most data.
+  const counts = useMemo(() => {
+    const m = { all: 0 };
+    ASSESSMENT_KEYS.forEach(k => { m[k] = 0; });
+    buckets.forEach(b => {
+      m.all += b.count;
+      ASSESSMENT_KEYS.forEach(k => {
+        m[k] += b.count * (b.assessmentMix[k] || 0);
+      });
+    });
+    return m;
+  }, [buckets]);
+
+  const Pill = ({ k, label, sub, active, color, Icon }) => (
+    <button onClick={() => onChange(k)} className="card-hover" style={{
+      display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px',
+      background: active ? color : 'transparent',
+      color:      active ? '#fff' : 'var(--text)',
+      border: `1px solid ${active ? color : 'var(--border)'}`,
+      fontSize: 12, fontWeight: 500, cursor: 'pointer',
+      transition: 'background 0.15s, border-color 0.15s, color 0.15s',
+    }}>
+      {Icon && <Icon size={13} />}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', lineHeight: 1.2 }}>
+        <span>{label}</span>
+        <span className="mono" style={{
+          fontSize: 9, fontVariantNumeric: 'tabular-nums',
+          color: active ? 'rgba(255,255,255,0.75)' : 'var(--text-dim)',
+          letterSpacing: '0.04em',
+        }}>{sub}</span>
+      </div>
+    </button>
+  );
+
+  return (
+    <div style={{
+      padding: '20px 28px 16px', borderBottom: `1px solid var(--border)`,
+      display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap',
+      background: 'var(--surface)',
+    }}>
+      <div style={{ display: 'flex', flexDirection: 'column', minWidth: 140 }}>
+        <span className="label" style={{ marginBottom: 2 }}>Assessment Source</span>
+        <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+          {assessment === 'all' ? 'All scanners — unfiltered' : 'Filtered to one source'}
+        </span>
+      </div>
+      <Pill k="all" label="All sources" sub={`${fmtNum(Math.round(counts.all))} findings`} active={assessment === 'all'} color="var(--accent)" />
+      {ASSESSMENT_KEYS.map(k => {
+        const t = ASSESSMENT_TYPES[k];
+        return <Pill key={k} k={k} label={t.short} sub={`${fmtNum(Math.round(counts[k]))} findings`} active={assessment === k} color={t.color} Icon={t.icon} />;
+      })}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSESSMENT CHIP — slim "Filtered to: X ✕" indicator for drill-down pages.
+// ─────────────────────────────────────────────────────────────────────────────
+function AssessmentChip({ assessment, onClear }) {
+  if (!assessment || assessment === 'all') return null;
+  const t = ASSESSMENT_TYPES[assessment];
+  if (!t) return null;
+  const Icon = t.icon;
+  return (
+    <div className="card-hover" style={{
+      display: 'inline-flex', alignItems: 'center', gap: 8, padding: '5px 10px 5px 10px',
+      background: 'var(--surface-2)', border: `1px solid ${t.color}`, color: t.color,
+      fontSize: 11, fontWeight: 500,
+    }}>
+      <Icon size={11} />
+      <span>Filtered: {t.label}</span>
+      <button
+        onClick={(e) => { e.stopPropagation(); onClear && onClear(); }}
+        title="Clear assessment filter"
+        style={{
+          background: 'transparent', border: 'none', color: t.color,
+          padding: 0, marginLeft: 4, display: 'flex', alignItems: 'center', cursor: 'pointer',
+        }}
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSESSMENT TAG — small color-coded type tag used in the findings table
+// ─────────────────────────────────────────────────────────────────────────────
+function AssessmentTag({ assessment, sm = false }) {
+  const t = ASSESSMENT_TYPES[assessment];
+  if (!t) return <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>—</span>;
+  const Icon = t.icon;
+  return (
+    <span title={t.label} style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5,
+      fontSize: sm ? 10 : 11, color: t.color, fontWeight: 500,
+      whiteSpace: 'nowrap',
+    }}>
+      <Icon size={sm ? 10 : 11} />
+      {t.short}
+    </span>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FILTERED EMPTY STATE — shown when the assessment filter hides the entire
+// page's content (e.g. opening a Coverity-only campaign with the filter set
+// to Pentest). The user can clear the filter from here without losing the
+// route.
+// ─────────────────────────────────────────────────────────────────────────────
+function FilteredEmptyState({ kind, label, assessment, onClearAssessment, onBack }) {
+  const t = ASSESSMENT_TYPES[assessment];
+  return (
+    <div className="fade-in" style={{ padding: '60px 28px', textAlign: 'center' }}>
+      <div className="label" style={{ marginBottom: 12, color: 'var(--text-dim)' }}>
+        Nothing to show
+      </div>
+      <h2 className="display" style={{ fontSize: 28, fontWeight: 400, margin: '0 0 12px', color: 'var(--text)' }}>
+        This {kind}{label ? ` — ${label}` : ''} has no findings from {t ? t.label : assessment}.
+      </h2>
+      <p style={{ color: 'var(--text-dim)', maxWidth: 520, margin: '0 auto 24px', fontSize: 13 }}>
+        The assessment filter is hiding everything on this page. Clear it to view the campaign in full, or go back to the operations brief.
+      </p>
+      <div style={{ display: 'inline-flex', gap: 10 }}>
+        <button onClick={onClearAssessment} style={{
+          background: 'var(--accent)', color: 'var(--bg)', border: 'none',
+          padding: '8px 16px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+        }}>Clear filter</button>
+        <button onClick={onBack} style={{
+          background: 'transparent', color: 'var(--text)', border: `1px solid var(--border)`,
+          padding: '8px 16px', fontSize: 12, cursor: 'pointer',
+        }}>Back to overview</button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SPARKLINE — minimal SVG line + area
 // ─────────────────────────────────────────────────────────────────────────────
 function Sparkline({ data, width = 140, height = 36, color = 'var(--accent)', showEnd = true }) {
@@ -1061,11 +1386,11 @@ function Sparkline({ data, width = 140, height = 36, color = 'var(--accent)', sh
   );
 }
 
-// SLA badge — red breached, amber approaching, no badge for OK
+// SLA badge — red overdue, amber approaching, no badge for OK
 function SlaBadge({ status, count, sm = false }) {
   if (!status || (count !== undefined && count === 0)) return null;
   const cfg = {
-    breached: { label: 'Breached', color: 'var(--sev-critical)', bg: 'rgba(220,38,38,0.08)' },
+    overdue: { label: 'Overdue', color: 'var(--sev-critical)', bg: 'rgba(220,38,38,0.08)' },
     approaching: { label: 'Approaching', color: 'var(--sev-high)', bg: 'rgba(234,88,12,0.08)' },
     ok: { label: 'On track', color: 'var(--good)', bg: 'transparent' },
   }[status];
@@ -1343,7 +1668,7 @@ function SummaryBand({ buckets, totalHours, burndown }) {
   const totalFindings = buckets.reduce((s, b) => s + b.count, 0);
   const criticalCount = buckets.reduce((s, b) => s + b.sevCounts[0], 0);
   const totalAffectedAssets = buckets.reduce((s, b) => s + b.affectedAssets, 0);
-  const breachedTotal = buckets.reduce((s, b) => s + b.breachedTotal, 0);
+  const overdueTotal = buckets.reduce((s, b) => s + b.overdueTotal, 0);
   const days = (totalHours / 8).toFixed(0);
   const burndownDelta = burndown ? Math.round((1 - burndown[burndown.length - 1] / burndown[0]) * 100) : 0;
 
@@ -1384,7 +1709,7 @@ function SummaryBand({ buckets, totalHours, burndown }) {
       </div>
       <StatNum value={fmtNum(criticalCount)} label="Critical Severity" accent="var(--sev-critical)" sub={`${((criticalCount/totalFindings)*100).toFixed(1)}% of total`} />
       <StatNum value={fmtHours(totalHours)} label="Estimated Effort" accent="var(--accent)" sub={`~${fmtNum(+days)} person-days`} />
-      <StatNum value={fmtNum(breachedTotal)} label="SLA Breached" accent="var(--sev-critical)" sub={`${((breachedTotal/totalFindings)*100).toFixed(1)}% out of policy`} />
+      <StatNum value={fmtNum(overdueTotal)} label="SLA Overdue" accent="var(--sev-critical)" sub={`${((overdueTotal/totalFindings)*100).toFixed(1)}% out of policy`} />
     </div>
   );
 }
@@ -1450,7 +1775,7 @@ function LensesRow({ buckets, hoursMap, onPick }) {
   const risk = [...enriched].sort((a, b) => b.riskPerHour - a.riskPerHour).slice(0, 3)
     .map(b => ({ ...b, metricLabel: `${Math.round(b.riskPerHour)} risk/hr`, subLabel: `${fmtNum(b.sevCounts[0])} crit` }));
   const policy = [...enriched].sort((a, b) => b.policyPressure - a.policyPressure).slice(0, 3)
-    .map(b => ({ ...b, metricLabel: `${fmtNum(b.breachedTotal)} late`, subLabel: `${fmtNum(b.breachedBySev[0])} crit · ${fmtNum(b.breachedBySev[1])} hi` }));
+    .map(b => ({ ...b, metricLabel: `${fmtNum(b.overdueTotal)} late`, subLabel: `${fmtNum(b.overdueBySev[0])} crit · ${fmtNum(b.overdueBySev[1])} hi` }));
   const quick = [...enriched].sort((a, b) => a.hours - b.hours).slice(0, 3)
     .map(b => ({ ...b, metricLabel: fmtHours(b.hours), subLabel: `${fmtNum(b.count)} fixes` }));
 
@@ -1667,7 +1992,7 @@ function BreakdownRow({ label, sub, subTip, value, total, color, valueLabel }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // BUCKET DETAIL
 // ─────────────────────────────────────────────────────────────────────────────
-function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown, assignedPeople, onOpenPicker }) {
+function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates, world, onAssetMeta, burndown, assignedPeople, onOpenPicker, onFindings, assessment, onClearAssessment }) {
   const [filterAsset, setFilterAsset] = useState('all');
   const [filterEnv, setFilterEnv] = useState('all');
   const [filterCrit, setFilterCrit] = useState('all');
@@ -1716,12 +2041,15 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
   return (
     <div className="fade-in">
       {/* breadcrumb */}
-      <div style={{ padding: '20px 28px', borderBottom: `1px solid var(--border)`, display: 'flex', alignItems: 'center', gap: 12 }}>
+      <div style={{ padding: '20px 28px', borderBottom: `1px solid var(--border)`, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <button onClick={onBack} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
           <ArrowLeft size={14} /> Operations Brief
         </button>
         <ChevronRight size={12} color="var(--text-faint)" />
         <span className="label" style={{ color: 'var(--text)' }}>Campaign</span>
+        <div style={{ marginLeft: 'auto' }}>
+          <AssessmentChip assessment={assessment} onClear={onClearAssessment} />
+        </div>
       </div>
 
       {/* hero */}
@@ -1802,28 +2130,28 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
           <div className="label" style={{ marginBottom: 4, color: 'var(--sev-critical)' }}>SLA · Policy Status</div>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 16 }}>
             <div className="display" style={{ fontSize: 36, color: 'var(--sev-critical)', fontWeight: 500, lineHeight: 1 }}>
-              {fmtNum(bucket.breachedTotal)}
+              {fmtNum(bucket.overdueTotal)}
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
-              breached
+              overdue
               <span style={{ color: 'var(--sev-high)', marginLeft: 12 }}>+ {fmtNum(bucket.approachingTotal)} approaching</span>
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-            {SEV.map((s, i) => bucket.breachedBySev[i] > 0 && (
+            {SEV.map((s, i) => bucket.overdueBySev[i] > 0 && (
               <span key={s} className="mono" style={{
                 fontSize: 10, padding: '2px 8px',
                 color: SEV_COLOR[i], border: `1px solid ${SEV_COLOR[i]}`,
                 letterSpacing: '0.04em',
               }}>
-                {fmtNum(bucket.breachedBySev[i])} {s.toLowerCase()} late
+                {fmtNum(bucket.overdueBySev[i])} {s.toLowerCase()} late
               </span>
             ))}
           </div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-dim)', maxWidth: 360 }}>
           Policy targets: critical 3d · high 90d · medium 180d · low 360d.
-          Findings past these thresholds count as breached.
+          Findings past these thresholds count as overdue.
         </div>
         {burndown && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
@@ -1938,7 +2266,14 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
               Showing {fmtNum(filtered.length)} of {fmtNum(enriched.length)} sampled · click any row to drill in
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button onClick={onFindings} className="card-hover" style={{
+              background: 'transparent', border: `1px solid var(--border-bright)`, color: 'var(--text)',
+              padding: '6px 12px', fontSize: 12, fontWeight: 500,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}>
+              <ListChecks size={13} /> View findings
+            </button>
             <FilterSelect value={filterAsset} onChange={setFilterAsset} options={[['all', 'All Asset Classes'], ...ASSET_TYPE_KEYS.map(k => [k, ASSET_TYPES[k].label])]} />
             <FilterSelect value={filterEnv} onChange={setFilterEnv} options={[['all', 'All Environments'], ...ENV_MIX.map(([e]) => [e, e])]} />
             <FilterSelect value={filterCrit} onChange={setFilterCrit} options={[['all', 'All Tiers'], ...CRIT_KEYS.map(k => [k, `${CRITICALITY[k].short} · ${CRITICALITY[k].label}`])]} />
@@ -1975,7 +2310,7 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
             )}
             {filtered.slice(0, 150).map((a, i) => {
               const A = ASSET_TYPES[a.asset.type];
-              const slaState = a.breachedTotal > 0 ? 'breached' : a.approachingTotal > 0 ? 'approaching' : null;
+              const slaState = a.overdueTotal > 0 ? 'overdue' : a.approachingTotal > 0 ? 'approaching' : null;
               return (
                 <div key={a.assetId} onClick={() => onAsset(a.assetId)} style={{
                   display: 'grid', gridTemplateColumns: '20px 1.5fr 90px 100px 65px 55px 60px 110px 1fr',
@@ -2005,7 +2340,7 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
                   </span>
                   <span>
                     {slaState
-                      ? <SlaBadge status={slaState} count={a.breachedTotal || a.approachingTotal} sm />
+                      ? <SlaBadge status={slaState} count={a.overdueTotal || a.approachingTotal} sm />
                       : <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>—</span>}
                   </span>
                   <span className="mono" style={{ color: 'var(--text-dim)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.cve}</span>
@@ -2027,7 +2362,7 @@ function BucketDetail({ bucket, hours, onBack, onAsset, estimates, setEstimates,
 // ─────────────────────────────────────────────────────────────────────────────
 // ASSET DETAIL — third level
 // ─────────────────────────────────────────────────────────────────────────────
-function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack, onCampaign, onAsset, onAssetMeta, burndown }) {
+function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack, onCampaign, onAsset, onAssetMeta, burndown, onFindings, assessment, onClearAssessment }) {
   const asset = world.assetMap.get(assetId);
   const entries = world.assetFindings.get(assetId) || [];
 
@@ -2051,7 +2386,7 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
   const totalFindings = entries.reduce((s, e) => s + e.findingsCount, 0);
   const totalSev = [0, 0, 0, 0];
   entries.forEach(e => e.sevCounts.forEach((c, i) => totalSev[i] += c));
-  const breachedTotal = entries.reduce((s, e) => s + e.breachedTotal, 0);
+  const overdueTotal = entries.reduce((s, e) => s + e.overdueTotal, 0);
   const approachingTotal = entries.reduce((s, e) => s + e.approachingTotal, 0);
   const oldestAge = entries.reduce((m, e) => Math.max(m, e.oldestAge), 0);
   const worstSev = totalSev.findIndex(c => c > 0);
@@ -2084,6 +2419,9 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
         )}
         <ChevronRight size={12} color="var(--text-faint)" />
         <span className="label" style={{ color: 'var(--text)' }}>Asset</span>
+        <div style={{ marginLeft: 'auto' }}>
+          <AssessmentChip assessment={assessment} onClear={onClearAssessment} />
+        </div>
       </div>
 
       {/* hero */}
@@ -2137,14 +2475,14 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
         gridTemplateColumns: 'auto 1fr auto', gap: 32, alignItems: 'center',
       }}>
         <div>
-          <div className="label" style={{ marginBottom: 4, color: breachedTotal > 0 ? 'var(--sev-critical)' : 'var(--good)' }}>SLA · Policy Status</div>
-          {breachedTotal > 0 ? (
+          <div className="label" style={{ marginBottom: 4, color: overdueTotal > 0 ? 'var(--sev-critical)' : 'var(--good)' }}>SLA · Policy Status</div>
+          {overdueTotal > 0 ? (
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 16 }}>
               <div className="display" style={{ fontSize: 32, color: 'var(--sev-critical)', fontWeight: 500, lineHeight: 1 }}>
-                {fmtNum(breachedTotal)}
+                {fmtNum(overdueTotal)}
               </div>
               <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
-                breached
+                overdue
                 {approachingTotal > 0 && <span style={{ color: 'var(--sev-high)', marginLeft: 12 }}>+ {fmtNum(approachingTotal)} approaching</span>}
               </div>
             </div>
@@ -2163,7 +2501,7 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
           </div>
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-dim)', maxWidth: 360 }}>
-          For {C.label.toLowerCase()} assets, SLA breaches escalate automatically to {asset.criticality === 'T1' ? 'P1 on-call' : 'team lead'} within 24 hours.
+          For {C.label.toLowerCase()} assets, Overdue findings escalate automatically to {asset.criticality === 'T1' ? 'P1 on-call' : 'team lead'} within 24 hours.
         </div>
         {burndown && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
@@ -2203,11 +2541,11 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
       <div style={{ padding: '28px 28px' }}>
         <div className="label" style={{ marginBottom: 4 }}>Campaigns affecting this asset</div>
         <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 16 }}>
-          Sorted by severity, then by hours. Click any campaign to see all assets it touches.
+          Sorted by severity, then by hours. Click any campaign to see all assets it touches, or open this asset's findings within that campaign.
         </div>
         <div style={{ border: `1px solid var(--border)` }}>
           <div className="label" style={{
-            display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 1fr 80px',
+            display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 110px 80px',
             gap: 16, padding: '10px 16px', borderBottom: `1px solid var(--border)`,
             background: 'var(--surface)',
           }}>
@@ -2215,7 +2553,7 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
           </div>
           {sorted.map((e, i) => (
             <div key={e.bucketId} onClick={() => onCampaign(e.bucketId)} className="clickable" style={{
-              display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 1fr 80px',
+              display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 110px 80px',
               gap: 16, padding: '12px 16px',
               borderBottom: i < sorted.length - 1 ? `1px solid var(--border)` : 'none',
               fontSize: 12, alignItems: 'center',
@@ -2232,14 +2570,22 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
               <span className="mono" style={{ color: 'var(--text)', fontVariantNumeric: 'tabular-nums' }}>{e.findingsCount}</span>
               <SeverityBar counts={e.sevCounts} height={5} />
               <span className="mono" style={{ color: 'var(--text-dim)', fontSize: 11 }}>{e.cve}</span>
-              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                <Link2 size={11} color="var(--text-faint)" />
-              </div>
+              <button
+                onClick={(ev) => { ev.stopPropagation(); onFindings && onFindings(e.bucketId); }}
+                title="View findings on this asset within this campaign"
+                style={{
+                  background: 'transparent', border: `1px solid var(--border)`,
+                  color: 'var(--text-dim)', padding: '4px 8px', fontSize: 11,
+                  display: 'inline-flex', alignItems: 'center', gap: 4, justifySelf: 'end',
+                }}
+              >
+                <List size={11} /> Findings
+              </button>
               <span className="mono" style={{ color: 'var(--accent)', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}>{fmtHours(e.hrs)}</span>
             </div>
           ))}
           <div style={{
-            display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 1fr 80px',
+            display: 'grid', gridTemplateColumns: '24px 1.6fr 80px 1fr 100px 110px 80px',
             gap: 16, padding: '12px 16px',
             borderTop: `2px solid var(--border-bright)`,
             background: 'var(--surface-2)', fontSize: 12,
@@ -2253,6 +2599,404 @@ function AssetDetail({ assetId, fromBucketId, world, buckets, estimates, onBack,
             <span className="mono display" style={{ color: 'var(--accent)', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 16 }}>{fmtHours(totalHrs)}</span>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FINDINGS VIEW — fourth level. Per-campaign or per-(asset×campaign).
+// ─────────────────────────────────────────────────────────────────────────────
+const FINDINGS_RENDER_CAP = 800;
+
+// Small Yes/No pill used for KEV and POC columns. "Yes" is loud, "No" is quiet.
+function YesNoBadge({ on, tone = 'critical' }) {
+  if (on) {
+    const color = tone === 'critical' ? 'var(--sev-critical)' : 'var(--sev-high)';
+    const bg    = tone === 'critical' ? 'rgba(220,38,38,0.10)' : 'rgba(234,88,12,0.10)';
+    return (
+      <span className="mono" style={{
+        display: 'inline-block', padding: '1px 7px', fontSize: 10, fontWeight: 600,
+        color, background: bg, border: `1px solid ${color}`,
+        letterSpacing: '0.05em', textTransform: 'uppercase',
+      }}>Yes</span>
+    );
+  }
+  return <span className="mono" style={{ fontSize: 10, color: 'var(--text-faint)', letterSpacing: '0.05em' }}>no</span>;
+}
+
+// Workflow status tag for the Status column.
+function StatusTag({ status }) {
+  const map = {
+    'Open':           { color: 'var(--text)',      bg: 'transparent',                border: 'var(--border)' },
+    'In Progress':    { color: 'var(--accent)',    bg: 'rgba(180,120,40,0.08)',      border: 'var(--accent)' },
+    'Risk Accepted':  { color: 'var(--sev-high)',  bg: 'transparent',                border: 'var(--sev-high)' },
+    'Fixed':          { color: 'var(--good)',      bg: 'rgba(22,163,74,0.08)',       border: 'var(--good)' },
+    'False Positive': { color: 'var(--text-faint)',bg: 'transparent',                border: 'var(--border)' },
+  };
+  const cfg = map[status] || map['Open'];
+  return (
+    <span className="mono" style={{
+      display: 'inline-block', padding: '1px 6px', fontSize: 10, fontWeight: 500,
+      color: cfg.color, background: cfg.bg, border: `1px solid ${cfg.border}`,
+      letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap',
+    }}>{status}</span>
+  );
+}
+
+// Color-grade priority score: red >= 3000, orange >= 2000, accent >= 1000, dim below.
+function priorityColor(score) {
+  if (score >= 3000) return 'var(--sev-critical)';
+  if (score >= 2000) return 'var(--sev-high)';
+  if (score >= 1000) return 'var(--accent)';
+  return 'var(--text-dim)';
+}
+
+function FindingsView({ bucket, asset, world, onBack, onCampaign, onAsset, onAssetMeta, assessment, onClearAssessment }) {
+  // Build the underlying findings list once per (bucket, asset) scope. The
+  // global assessment filter is applied here at the per-finding level (each
+  // finding has a `.assessment` derived from its campaign's mix).
+  const findings = useMemo(() => {
+    if (!bucket) return [];
+    const entries = world.bucketAssets.get(bucket.id) || [];
+    const scoped = asset ? entries.filter(e => e.assetId === asset.id) : entries;
+    const all = [];
+    scoped.forEach(e => {
+      const a = world.assetMap.get(e.assetId);
+      if (!a) return;
+      const fs = materializeFindings(e, a, bucket);
+      fs.forEach(f => all.push({ ...f, asset: a }));
+    });
+    if (assessment && assessment !== 'all') {
+      return all.filter(f => f.assessment === assessment);
+    }
+    return all;
+  }, [bucket, asset, world, assessment]);
+
+  // Filters
+  const [filterSev, setFilterSev]       = useState('all');
+  const [filterSla, setFilterSla]       = useState('all');
+  const [filterKev, setFilterKev]       = useState('all');
+  const [filterPoc, setFilterPoc]       = useState('all');
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [sortBy, setSortBy]             = useState('priority');
+  const [selected, setSelected]         = useState(() => new Set());
+
+  // Reset selection if scope changes (different campaign / asset / assessment)
+  useEffect(() => {
+    setSelected(new Set());
+  }, [bucket && bucket.id, asset && asset.id, assessment]);
+
+  const filtered = useMemo(() => {
+    let out = findings;
+    if (filterSev !== 'all')    out = out.filter(f => SEV[f.severity] === filterSev);
+    if (filterSla !== 'all')    out = out.filter(f => f.slaState === filterSla);
+    if (filterKev !== 'all')    out = out.filter(f => (filterKev === 'yes') ? f.kev : !f.kev);
+    if (filterPoc !== 'all')    out = out.filter(f => (filterPoc === 'yes') ? f.poc : !f.poc);
+    if (filterStatus !== 'all') out = out.filter(f => f.workflowStatus === filterStatus);
+
+    if (sortBy === 'priority')   out = [...out].sort((a, b) => b.priorityScore - a.priorityScore);
+    else if (sortBy === 'severity') out = [...out].sort((a, b) => a.severity - b.severity || b.priorityScore - a.priorityScore);
+    else if (sortBy === 'age')   out = [...out].sort((a, b) => b.age - a.age);
+    else if (sortBy === 'first') out = [...out].sort((a, b) => a.firstFound.localeCompare(b.firstFound));
+    else if (sortBy === 'kev')   out = [...out].sort((a, b) => (b.kev - a.kev) || (b.priorityScore - a.priorityScore));
+    return out;
+  }, [findings, filterSev, filterSla, filterKev, filterPoc, filterStatus, sortBy]);
+
+  // Stats over the (assessment-filtered) finding set
+  const stats = useMemo(() => {
+    let critHigh = 0, overdue = 0, kev = 0;
+    findings.forEach(f => {
+      if (f.severity <= 1) critHigh++;
+      if (f.slaState === 'overdue') overdue++;
+      if (f.kev) kev++;
+    });
+    return { total: findings.length, critHigh, overdue, kev };
+  }, [findings]);
+
+  const visible = filtered.slice(0, FINDINGS_RENDER_CAP);
+  const allVisibleSelected = visible.length > 0 && visible.every(f => selected.has(f.id));
+  const someVisibleSelected = !allVisibleSelected && visible.some(f => selected.has(f.id));
+
+  const toggleOne = (id) => {
+    setSelected(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      return n;
+    });
+  };
+  const toggleAllVisible = () => {
+    setSelected(prev => {
+      const n = new Set(prev);
+      if (allVisibleSelected) {
+        visible.forEach(f => n.delete(f.id));
+      } else {
+        visible.forEach(f => n.add(f.id));
+      }
+      return n;
+    });
+  };
+  const clearSelection = () => setSelected(new Set());
+
+  // Three grid templates — Asset col toggles when scoped to one asset, and
+  // Assessment col is hidden when global assessment filter is locked to one
+  // type (since every visible row would have the same value).
+  const showAssessmentCol = !assessment || assessment === 'all';
+  const cols = (() => {
+    // checkbox · sevDot · finding · cve · [asset] · kev · poc · priority · firstFound · age · sla · [assessment] · status
+    const parts = ['24px', '16px', '1.4fr', '1.1fr'];
+    if (!asset) parts.push('1.4fr');                    // asset
+    parts.push('50px', '50px', '90px', '100px', '50px', '110px');
+    if (showAssessmentCol) parts.push('110px');         // assessment
+    parts.push('110px');                                 // status
+    return parts.join(' ');
+  })();
+
+  // Severity options derived from data so empty severities don't show.
+  const sevPresent = useMemo(() => {
+    const s = new Set();
+    findings.forEach(f => s.add(SEV[f.severity]));
+    return SEV.filter(x => s.has(x));
+  }, [findings]);
+
+  const resetFilters = () => {
+    setFilterSev('all'); setFilterSla('all'); setFilterKev('all'); setFilterPoc('all'); setFilterStatus('all');
+  };
+
+  return (
+    <div className="fade-in">
+      {/* breadcrumb */}
+      <div style={{ padding: '20px 28px', borderBottom: `1px solid var(--border)`, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <button onClick={onBack} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+          <ArrowLeft size={14} /> Operations Brief
+        </button>
+        <ChevronRight size={12} color="var(--text-faint)" />
+        <button onClick={() => onCampaign(bucket.id)} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', fontSize: 12 }}>
+          {bucket.verb} {bucket.noun}
+        </button>
+        {asset && (
+          <>
+            <ChevronRight size={12} color="var(--text-faint)" />
+            <button onClick={() => onAsset(asset.id)} style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', fontSize: 12 }} className="mono">
+              {asset.id}
+            </button>
+          </>
+        )}
+        <ChevronRight size={12} color="var(--text-faint)" />
+        <span className="label" style={{ color: 'var(--text)' }}>Findings</span>
+        <div style={{ marginLeft: 'auto' }}>
+          <AssessmentChip assessment={assessment} onClear={onClearAssessment} />
+        </div>
+      </div>
+
+      {/* hero */}
+      <div style={{ padding: '32px 28px 28px', borderBottom: `1px solid var(--border)`, position: 'relative' }} className="grain">
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr', gap: 32, alignItems: 'end' }}>
+          <div>
+            <div className="label" style={{ marginBottom: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <ListChecks size={11} /> Findings · {bucket.verb} {bucket.noun}
+              {asset && <><span style={{ color: 'var(--text-faint)' }}>·</span><span className="mono" style={{ textTransform: 'none', letterSpacing: 0 }}>{asset.id}</span></>}
+            </div>
+            <h1 className="display" style={{ fontSize: 44, fontWeight: 400, margin: 0, lineHeight: 1, color: 'var(--text)' }}>
+              {asset ? 'Findings on this asset' : 'All findings'}
+            </h1>
+            <p style={{ color: 'var(--text-dim)', marginTop: 14, maxWidth: 560, fontSize: 13 }}>
+              Individual finding-level view. Multi-select rows to bundle into a Corrective Action Plan.
+              {asset
+                ? <> Scoped to <span className="mono" style={{ color: 'var(--text)' }}>{asset.id}</span> within this campaign.</>
+                : <> Spans every asset affected by this campaign.</>}
+            </p>
+          </div>
+          <StatNum value={fmtNum(stats.total)} label="Findings" sub={asset ? 'on this asset' : `across ${bucket.affectedAssets ? '~' + fmtNum(bucket.affectedAssets) : ''} assets`} />
+          <StatNum value={fmtNum(stats.critHigh)} label="Critical + High" accent="var(--sev-critical)" sub={`${((stats.critHigh / Math.max(1, stats.total)) * 100).toFixed(0)}% of findings`} />
+          <StatNum value={fmtNum(stats.overdue)} label="SLA Overdue" accent={stats.overdue > 0 ? 'var(--sev-critical)' : 'var(--good)'} sub={stats.overdue > 0 ? 'past policy threshold' : 'all within policy'} />
+          <StatNum value={fmtNum(stats.kev)} label="KEV" accent={stats.kev > 0 ? 'var(--sev-critical)' : 'var(--text-dim)'} sub="known exploited" />
+        </div>
+      </div>
+
+      {/* action bar — selection + CAP buttons */}
+      <div style={{
+        padding: '16px 28px', borderBottom: `1px solid var(--border)`,
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        background: selected.size > 0 ? 'var(--surface-2)' : 'var(--surface)', gap: 16, flexWrap: 'wrap',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, minWidth: 0 }}>
+          <div className="display" style={{ fontSize: 22, fontWeight: 500, color: selected.size > 0 ? 'var(--accent)' : 'var(--text-dim)', fontVariantNumeric: 'tabular-nums' }}>
+            {fmtNum(selected.size)}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+            selected
+            {selected.size > 0 && (
+              <button onClick={clearSelection} style={{ marginLeft: 12, background: 'transparent', border: 'none', color: 'var(--text-faint)', fontSize: 11, textDecoration: 'underline' }}>
+                clear
+              </button>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            disabled={selected.size === 0}
+            onClick={() => {/* placeholder */}}
+            className={selected.size > 0 ? 'card-hover' : ''}
+            style={{
+              background: selected.size > 0 ? 'var(--accent)' : 'transparent',
+              color:      selected.size > 0 ? 'var(--bg)'     : 'var(--text-faint)',
+              border: `1px solid ${selected.size > 0 ? 'var(--accent)' : 'var(--border)'}`,
+              padding: '8px 14px', fontSize: 12, fontWeight: 600,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              cursor: selected.size > 0 ? 'pointer' : 'not-allowed',
+            }}
+          >
+            <Plus size={13} /> Add to CAP
+          </button>
+          <button
+            disabled={selected.size === 0}
+            onClick={() => {/* placeholder */}}
+            className={selected.size > 0 ? 'card-hover' : ''}
+            style={{
+              background: 'transparent',
+              color: selected.size > 0 ? 'var(--text)' : 'var(--text-faint)',
+              border: `1px solid ${selected.size > 0 ? 'var(--border-bright)' : 'var(--border)'}`,
+              padding: '8px 14px', fontSize: 12, fontWeight: 500,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              cursor: selected.size > 0 ? 'pointer' : 'not-allowed',
+            }}
+          >
+            <FilePlus size={13} /> Add to Existing CAP
+          </button>
+        </div>
+      </div>
+
+      {/* filter row */}
+      <div style={{
+        padding: '14px 28px', borderBottom: `1px solid var(--border)`,
+        display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+        background: 'var(--surface)',
+      }}>
+        <div style={{ fontSize: 12, color: 'var(--text-dim)', marginRight: 8 }}>
+          Showing <span style={{ color: 'var(--text)' }}>{fmtNum(filtered.length)}</span> of {fmtNum(stats.total)}
+        </div>
+        <FilterSelect value={filterSev}    onChange={setFilterSev}    options={[['all', 'All Severities'],   ...sevPresent.map(s => [s, s])]} />
+        <FilterSelect value={filterSla}    onChange={setFilterSla}    options={[['all', 'All SLA'],          ['overdue', 'Overdue'], ['approaching', 'Approaching'], ['ok', 'On track']]} />
+        <FilterSelect value={filterKev}    onChange={setFilterKev}    options={[['all', 'KEV: any'],         ['yes', 'KEV: yes'],   ['no', 'KEV: no']]} w={120} />
+        <FilterSelect value={filterPoc}    onChange={setFilterPoc}    options={[['all', 'POC: any'],         ['yes', 'POC: yes'],   ['no', 'POC: no']]} w={120} />
+        <FilterSelect value={filterStatus} onChange={setFilterStatus} options={[['all', 'All Statuses'], ...STATUS_OPTS.map(([s]) => [s, s])]} />
+        <FilterSelect value={sortBy}       onChange={setSortBy}       options={[
+          ['priority', 'Sort: Priority Score'],
+          ['severity', 'Sort: Severity'],
+          ['kev',      'Sort: KEV first'],
+          ['age',      'Sort: Oldest first'],
+          ['first',    'Sort: First found'],
+        ]} w={170} />
+      </div>
+
+      {/* table */}
+      <div style={{ padding: '20px 28px' }}>
+        <div style={{ border: `1px solid var(--border)` }}>
+          <div className="label" style={{
+            display: 'grid', gridTemplateColumns: cols,
+            gap: 12, padding: '10px 16px', borderBottom: `1px solid var(--border)`,
+            background: 'var(--surface)', alignItems: 'center',
+          }}>
+            <span style={{ display: 'flex', alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={allVisibleSelected}
+                ref={el => { if (el) el.indeterminate = someVisibleSelected; }}
+                onChange={toggleAllVisible}
+                style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+              />
+            </span>
+            <span></span>
+            <span>Finding</span>
+            <span>CVE</span>
+            {!asset && <span>Asset</span>}
+            <span>KEV</span>
+            <span>POC</span>
+            <span style={{ textAlign: 'right' }}>Priority</span>
+            <span>First Found</span>
+            <span>Age</span>
+            <span>SLA</span>
+            {showAssessmentCol && <span>Source</span>}
+            <span>Status</span>
+          </div>
+
+          {visible.length === 0 && (
+            <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
+              <div style={{ marginBottom: 8 }}>No findings match the current filters.</div>
+              <button onClick={resetFilters} style={{
+                background: 'transparent', border: `1px solid var(--border)`,
+                color: 'var(--text)', padding: '6px 12px', fontSize: 12,
+              }}>Reset filters</button>
+            </div>
+          )}
+
+          <div style={{ maxHeight: 600, overflowY: 'auto' }}>
+            {visible.map((f, i) => {
+              const isSel = selected.has(f.id);
+              return (
+                <div key={f.id} onClick={() => toggleOne(f.id)} style={{
+                  display: 'grid', gridTemplateColumns: cols,
+                  gap: 12, padding: '10px 16px',
+                  borderBottom: i < visible.length - 1 ? `1px solid var(--border)` : 'none',
+                  fontSize: 12, alignItems: 'center', cursor: 'pointer',
+                  background: isSel ? 'rgba(180,120,40,0.06)' : 'transparent',
+                }} className="clickable">
+                  <span onClick={e => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center' }}>
+                    <input
+                      type="checkbox"
+                      checked={isSel}
+                      onChange={() => toggleOne(f.id)}
+                      style={{ accentColor: 'var(--accent)', cursor: 'pointer' }}
+                    />
+                  </span>
+                  <SevDot sev={f.severity} size={6} />
+                  <span className="mono" style={{ color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.id}</span>
+                  <span className="mono" style={{ color: 'var(--text-dim)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.cve}</span>
+                  {!asset && (
+                    <div onClick={e => { e.stopPropagation(); onAsset(f.assetId); }}
+                         style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, color: 'var(--text-dim)' }}
+                         className="card-hover">
+                      <span className="mono" style={{ color: 'var(--text-dim)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>
+                        {f.assetId}
+                      </span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onAssetMeta && onAssetMeta(f.assetId); }}
+                        title="Asset metadata"
+                        style={{ background: 'transparent', border: 'none', padding: 2, color: 'var(--text-faint)', display: 'flex', alignItems: 'center', flexShrink: 0 }}
+                      >
+                        <Info size={12} />
+                      </button>
+                    </div>
+                  )}
+                  <YesNoBadge on={f.kev} tone="critical" />
+                  <YesNoBadge on={f.poc} tone="high" />
+                  <span className="mono" style={{
+                    textAlign: 'right', fontVariantNumeric: 'tabular-nums',
+                    color: priorityColor(f.priorityScore), fontWeight: 600,
+                  }}>{f.priorityScore}</span>
+                  <span className="mono" style={{ color: 'var(--text-dim)', fontSize: 11 }}>{f.firstFound}</span>
+                  <span className="mono" style={{
+                    color: f.slaState === 'overdue' ? 'var(--sev-critical)' : 'var(--text-dim)',
+                    fontSize: 11, fontVariantNumeric: 'tabular-nums',
+                  }}>{f.age}d</span>
+                  <span>
+                    {f.slaState === 'ok'
+                      ? <span style={{ color: 'var(--text-faint)', fontSize: 11 }}>—</span>
+                      : <SlaBadge status={f.slaState} sm />}
+                  </span>
+                  {showAssessmentCol && <AssessmentTag assessment={f.assessment} sm />}
+                  <StatusTag status={f.workflowStatus} />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        {filtered.length > FINDINGS_RENDER_CAP && (
+          <div style={{ padding: '12px 16px', color: 'var(--text-dim)', fontSize: 12, textAlign: 'center', borderLeft: `1px solid var(--border)`, borderRight: `1px solid var(--border)`, borderBottom: `1px solid var(--border)` }}>
+            + {fmtNum(filtered.length - FINDINGS_RENDER_CAP)} more · in production this list would virtualize
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2428,12 +3172,108 @@ export default function App() {
     buckets.forEach(b => { m[b.id] = computeEffectiveHours(b, estimates[b.id]); });
     return m;
   }, [buckets, estimates]);
-  const totalHours = Object.values(hoursMap).reduce((a, b) => a + b, 0);
-  const totalFindings = buckets.reduce((s, b) => s + b.count, 0);
+
+  const assessment = route.assessment || 'all';
+
+  // Display data — buckets, hours map, and per-asset entries scaled by each
+  // bucket's share of the active assessment filter. Buckets with zero share of
+  // the selected type are dropped entirely so the treemap, lens cards, and
+  // overview totals match the active filter. The original `buckets`/`world`
+  // are still available for any view that needs the unfiltered data.
+  const displayBuckets = useMemo(() => {
+    if (assessment === 'all') return buckets;
+    return buckets
+      .map(b => {
+        const s = bucketShare(b, assessment);
+        if (s <= 0) return null;
+        const scale = (n) => Math.round(n * s);
+        const scaleArr = (arr) => arr.map(scale);
+        return {
+          ...b,
+          count: scale(b.count),
+          sevCounts: scaleArr(b.sevCounts),
+          assetCounts: scaleArr(b.assetCounts),
+          affectedAssetsByType: scaleArr(b.affectedAssetsByType),
+          affectedAssets: scale(b.affectedAssets),
+          riskScore: b.riskScore * s,
+          overdueBySev: scaleArr(b.overdueBySev),
+          approachingBySev: scaleArr(b.approachingBySev),
+          overdueTotal: scale(b.overdueTotal),
+          approachingTotal: scale(b.approachingTotal),
+          policyPressure: b.policyPressure * s,
+          assetMix: Object.fromEntries(Object.entries(b.assetMix).map(([k, v]) => [k, scale(v)])),
+          _share: s,
+        };
+      })
+      .filter(Boolean);
+  }, [buckets, assessment]);
+
+  const displayHoursMap = useMemo(() => {
+    if (assessment === 'all') return hoursMap;
+    const m = {};
+    displayBuckets.forEach(b => { m[b.id] = (hoursMap[b.id] || 0) * b._share; });
+    return m;
+  }, [hoursMap, displayBuckets, assessment]);
+
+  // Scale per-asset entries inside world.bucketAssets so per-bucket asset
+  // tables and per-asset campaign tables reflect the filter too.
+  const displayWorld = useMemo(() => {
+    if (assessment === 'all') return world;
+    const newBucketAssets = new Map();
+    const newAssetFindings = new Map();
+    buckets.forEach(b => {
+      const s = bucketShare(b, assessment);
+      if (s <= 0) return;
+      const list = (world.bucketAssets.get(b.id) || []).map(e => {
+        const fc = Math.max(1, Math.round(e.findingsCount * s));
+        const scaleArr = (arr) => arr.map(n => Math.round(n * s));
+        return {
+          ...e,
+          findingsCount: fc,
+          sevCounts: scaleArr(e.sevCounts),
+          overdueBySev: scaleArr(e.overdueBySev),
+          approachingBySev: scaleArr(e.approachingBySev),
+          overdueTotal: Math.round(e.overdueTotal * s),
+          approachingTotal: Math.round(e.approachingTotal * s),
+        };
+      });
+      newBucketAssets.set(b.id, list);
+      list.forEach(e => {
+        if (!newAssetFindings.has(e.assetId)) newAssetFindings.set(e.assetId, []);
+        newAssetFindings.get(e.assetId).push(e);
+      });
+    });
+    // Burndown — scale uniformly by the global share across all buckets so the
+    // trend chart visually reflects the filter while staying smooth.
+    const totalCount = buckets.reduce((acc, b) => acc + b.count, 0);
+    const filteredCount = buckets.reduce((acc, b) => acc + b.count * bucketShare(b, assessment), 0);
+    const globalScale = totalCount > 0 ? filteredCount / totalCount : 0;
+    const scaleSeries = (s) => s ? s.map(p => ({ ...p, value: Math.round(p.value * globalScale) })) : s;
+    const newBurndowns = {
+      global: scaleSeries(world.burndowns.global),
+      byBucket: new Map([...world.burndowns.byBucket.entries()].map(([bid, series]) => {
+        const sc = bucketShare(buckets.find(b => b.id === bid), assessment);
+        return [bid, series.map(p => ({ ...p, value: Math.round(p.value * sc) }))];
+      })),
+      byAsset: new Map([...world.burndowns.byAsset.entries()].map(([aid, series]) => {
+        return [aid, series.map(p => ({ ...p, value: Math.round(p.value * globalScale) }))];
+      })),
+    };
+    return {
+      ...world,
+      bucketAssets: newBucketAssets,
+      assetFindings: newAssetFindings,
+      burndowns: newBurndowns,
+    };
+  }, [world, buckets, assessment]);
+
+  const totalHours = Object.values(displayHoursMap).reduce((a, b) => a + b, 0);
+  const totalFindings = displayBuckets.reduce((s, b) => s + b.count, 0);
 
   const goOverview = () => navigate({ kind: 'overview' });
   const goBucket = (id) => navigate({ kind: 'bucket', bucketId: id });
   const goAsset = (assetId, bucketId) => navigate({ kind: 'asset', bucketId: bucketId || route.bucketId, assetId });
+  const goFindings = (bucketId, assetId = null) => navigate({ kind: 'findings', bucketId, assetId });
   const selectTheme = (next) => navigate(undefined, next);
   const openMeta = (assetId) => setMetaAssetId(assetId);
   const closeMeta = () => setMetaAssetId(null);
@@ -2446,16 +3286,27 @@ export default function App() {
   const peopleFor = (bucketId) => (assignments[bucketId] || [])
     .map(id => PEOPLE_BY_ID.get(id)).filter(Boolean);
 
-  const selectedBucket = (route.kind === 'bucket' || route.kind === 'asset') ? buckets.find(b => b.id === route.bucketId) : null;
+  const setAssessment = useCallback((next) => navigate(undefined, undefined, next), [navigate]);
+
+  const selectedBucket = (route.kind === 'bucket' || route.kind === 'asset' || route.kind === 'findings')
+    ? displayBuckets.find(b => b.id === route.bucketId) : null;
+  // The unfiltered bucket (used when the assessment filter has hidden the
+  // current bucket — we still want to render a placeholder rather than
+  // bouncing to overview).
+  const selectedBucketRaw = (route.kind === 'bucket' || route.kind === 'asset' || route.kind === 'findings')
+    ? buckets.find(b => b.id === route.bucketId) : null;
+  const findingsAsset = (route.kind === 'findings' && route.assetId) ? world.assetMap.get(route.assetId) : null;
   const metaAsset = metaAssetId ? world.assetMap.get(metaAssetId) : null;
   const pickerBucket = pickerBucketId ? buckets.find(b => b.id === pickerBucketId) : null;
 
-  // If a deep-link points at an unknown bucket from a bucket route, recover
+  // If a deep-link points at a totally unknown bucket id, recover to overview.
+  // (We do NOT recover when the bucket exists but has been hidden by the
+  // assessment filter — those pages render a "no findings of this type" state.)
   useEffect(() => {
-    if (route.kind === 'bucket' && route.bucketId && !selectedBucket) {
+    if ((route.kind === 'bucket' || route.kind === 'findings' || route.kind === 'asset') && route.bucketId && !selectedBucketRaw) {
       navigate({ kind: 'overview' });
     }
-  }, [route.kind, route.bucketId, selectedBucket, navigate]);
+  }, [route.kind, route.bucketId, selectedBucketRaw, navigate]);
 
   return (
     <div style={{ minHeight: '100vh', background: 'var(--bg)', color: 'var(--text)' }}>
@@ -2471,44 +3322,75 @@ export default function App() {
 
       {route.kind === 'overview' && (
         <div className="fade-in">
-          <SummaryBand buckets={buckets} totalHours={totalHours} burndown={world.burndowns.global} />
-          <LensesRow buckets={buckets} hoursMap={hoursMap} onPick={goBucket} />
+          <AssessmentFilter assessment={assessment} onChange={setAssessment} buckets={buckets} />
+          <SummaryBand buckets={displayBuckets} totalHours={totalHours} burndown={displayWorld.burndowns.global} assessment={assessment} />
+          <LensesRow buckets={displayBuckets} hoursMap={displayHoursMap} onPick={goBucket} />
           <CampaignTreemap
-            buckets={buckets} hoursMap={hoursMap} onPick={goBucket} theme={route.theme}
+            buckets={displayBuckets} hoursMap={displayHoursMap} onPick={goBucket} theme={route.theme}
             assignmentsByBucket={peopleFor}
           />
           <Footer totalFindings={totalFindings} />
         </div>
       )}
 
-      {route.kind === 'bucket' && selectedBucket && (
-        <BucketDetail
-          bucket={selectedBucket}
-          hours={hoursMap[selectedBucket.id]}
-          onBack={goOverview}
-          onAsset={(aid) => goAsset(aid, selectedBucket.id)}
-          onAssetMeta={openMeta}
-          estimates={estimates}
-          setEstimates={setEstimates}
-          world={world}
-          burndown={world.burndowns.byBucket.get(selectedBucket.id)}
-          assignedPeople={peopleFor(selectedBucket.id)}
-          onOpenPicker={openPicker}
-        />
+      {route.kind === 'bucket' && selectedBucketRaw && (
+        selectedBucket ? (
+          <BucketDetail
+            bucket={selectedBucket}
+            hours={displayHoursMap[selectedBucket.id]}
+            onBack={goOverview}
+            onAsset={(aid) => goAsset(aid, selectedBucket.id)}
+            onAssetMeta={openMeta}
+            onFindings={() => goFindings(selectedBucket.id)}
+            estimates={estimates}
+            setEstimates={setEstimates}
+            world={displayWorld}
+            burndown={displayWorld.burndowns.byBucket.get(selectedBucket.id)}
+            assignedPeople={peopleFor(selectedBucket.id)}
+            onOpenPicker={openPicker}
+            assessment={assessment}
+            onClearAssessment={() => setAssessment('all')}
+          />
+        ) : (
+          <FilteredEmptyState
+            kind="campaign"
+            label={selectedBucketRaw ? `${selectedBucketRaw.verb} ${selectedBucketRaw.noun}` : ''}
+            assessment={assessment}
+            onClearAssessment={() => setAssessment('all')}
+            onBack={goOverview}
+          />
+        )
       )}
 
       {route.kind === 'asset' && (
         <AssetDetail
           assetId={route.assetId}
           fromBucketId={route.bucketId}
-          world={world}
-          buckets={buckets}
+          world={displayWorld}
+          buckets={displayBuckets}
           estimates={estimates}
           onBack={goOverview}
           onCampaign={goBucket}
           onAsset={(aid) => goAsset(aid, route.bucketId)}
           onAssetMeta={openMeta}
-          burndown={world.burndowns.byAsset.get(route.assetId)}
+          onFindings={(bucketId) => goFindings(bucketId, route.assetId)}
+          burndown={displayWorld.burndowns.byAsset.get(route.assetId)}
+          assessment={assessment}
+          onClearAssessment={() => setAssessment('all')}
+        />
+      )}
+
+      {route.kind === 'findings' && selectedBucketRaw && (
+        <FindingsView
+          bucket={selectedBucketRaw}
+          asset={findingsAsset}
+          world={world}
+          onBack={goOverview}
+          onCampaign={goBucket}
+          onAsset={(aid) => goAsset(aid, selectedBucketRaw.id)}
+          onAssetMeta={openMeta}
+          assessment={assessment}
+          onClearAssessment={() => setAssessment('all')}
         />
       )}
 
@@ -2518,7 +3400,7 @@ export default function App() {
         buckets={buckets}
         estimates={estimates}
         setEstimates={setEstimates}
-        baseTotalHours={totalHours}
+        baseTotalHours={Object.values(hoursMap).reduce((a, b) => a + b, 0)}
       />
 
       {metaAsset && (

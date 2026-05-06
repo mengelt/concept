@@ -48,6 +48,7 @@ Each finding carries an age in days; status is derived as *OK*, *Approaching*, o
 
 The landing surface, designed to answer "where do I focus today?" in a single screen.
 
+- **Global search.** A live search input in the header spans the entire app. Searches across asset IDs, hostnames, IPs, team names, and campaign names; results appear in a dropdown grouped by kind (Campaigns / Assets) with prefix matches sorted ahead of substring matches. Click or Enter to navigate (Arrow keys move highlight, Esc dismisses). Capped at 12 results so the dropdown stays scannable. Index is precomputed once across all 5K assets + 25 campaigns so typing stays snappy.
 - **Assessment Source filter.** A pill row at the top scopes everything below it — treemap, lens cards, totals, and every drill-down — to findings from a single scanner: Continuous Scan (Rapid7/Tenable-style), Coverity (SAST), Configuration Audit (CIS hardening), Cloud Posture (CSPM), Penetration Test, or Dependency Scan. "All sources" is the default. Each pill shows the running finding count for that source. The filter is encoded as `?assessment=…` in the URL so it's bookmarkable and survives refresh; it propagates through every drill-down (campaign, asset, findings) where it's shown as a small "Filtered: X ✕" chip on the breadcrumb that the user can clear in one click.
 - **Headline band.** Total findings, total affected assets, total estimated effort, and total SLA overdue — alongside an inline 90-day burndown sparkline showing trajectory. Reflects the active assessment filter.
 - **Four lens cards** for the top campaigns through different prioritization framings:
@@ -55,7 +56,9 @@ The landing surface, designed to answer "where do I focus today?" in a single sc
   - **Risk Crushers** — highest severity-weighted risk score per hour (critical ×10, high ×7.5, medium ×5, low ×2 then divided by effort hours). *Highest danger per hour.*
   - **Policy Alignment** — campaigns with the most SLA overdue findings, weighted by severity. *Most past SLA.*
   - **Quick Wins** — smallest end-to-end effort. *Smallest end-to-end.*
-- **Effort Map (treemap).** All 25 campaigns sized by total effort hours, color-coded by dominant severity. The left strip on each cell encodes severity explicitly. Cells with assignees show a small avatar stack in the top-right corner; unassigned cells get a subtle dim strip along the bottom edge so "what isn't being worked" is scannable at a glance. Click a cell to drill in.
+- **Only my campaigns toggle.** A checkbox row directly above the Effort Map filters the treemap to campaigns the current user is assigned to. The current user is identified by `CURRENT_USER_ID` (defaults to `jane.doe`) and appears next to the checkbox as an avatar with name so it's clear who "you" are. Shows a running count: "5 of 25" when filtering, "25 total" otherwise. Persisted in URL as `?mine=1` so it composes with the assessment filter and survives refresh. Lens cards and the summary band stay org-wide (navigational context); only the effort map narrows to your queue.
+- **"Only my campaigns" toggle.** A checkbox above the Effort Map filters the treemap to campaigns the current user (`CURRENT_USER_ID`, defaults to `jane.doe`) is assigned to. Shows a count like "4 of 25" next to the checkbox so it's clear what was filtered out. The summary band and lens cards stay org-wide on purpose — they're navigational context, not "my work." Persisted as `?mine=1` in the URL. Composes with the assessment filter: hidden buckets stay hidden in both modes.
+- **Effort Map (treemap).** All 25 campaigns sized by total effort hours, color-coded by dominant severity. The left strip on each cell encodes severity explicitly. Cells with assignees show a small avatar stack in the top-right corner; unassigned cells get a subtle dim strip along the bottom edge so "what isn't being worked" is scannable at a glance. Click a cell to drill in. Empty state appears when filters combine to hide every campaign, with a hint about which filter to clear.
 
 ### Campaign Detail (bucket)
 
@@ -138,6 +141,11 @@ Top-right cog opens a 540px slide-over for tuning per-campaign baseline hours.
 
 ## Cross-cutting features
 
+### Global search
+A persistent search input lives in the top header and is available from every page. The index is built once over the world: every campaign (by verb + noun) and every asset (by id, hostname, IP, team, criticality, environment) — ~5,025 entries total. Typing 2+ characters surfaces a dropdown of up to 12 results with prefix matches sorted before substring matches and campaigns ranked above assets at equal relevance. Asset rows show their hostname/IP/team/tier as a sub-line; campaign rows show finding count and affected asset count. Arrow keys navigate; Enter picks the highlighted result; Esc closes; clicking outside dismisses. Pressing **/** anywhere on the page focuses the search field (suppressed when typing in other inputs). A small `/` hint inside the field advertises the shortcut.
+
+Picking an asset jumps to that asset's detail page using the first campaign that affects it as the breadcrumb anchor; picking a campaign jumps to its detail page. Both navigations preserve any active assessment filter.
+
 ### Theme system
 Three themes ship: **Light** (warm cream / amber accent — default), **Dark** (warm dark / amber accent), **Midnight** (cool navy / teal accent). Themes live in a single `THEMES` registry where each theme owns a complete set of CSS variables, applied at runtime via `document.documentElement.style.setProperty`. Adding a new theme is copy-paste-and-tweak — the picker UI auto-discovers it. The picker is a small dropdown in the header that shows each theme as a name plus a four-cell color swatch preview, with a check mark on the current one. Theme selection persists across reloads via the URL.
 
@@ -152,6 +160,7 @@ Hash-based routing so any view is bookmarkable and shareable:
 #/c/patch-log4j/a/srv-prd-1042/findings         findings on one asset within a campaign
 #/?theme=midnight                               any of the above + theme override
 #/?assessment=coverity                          any of the above + assessment-source filter
+#/?mine=1                                       overview filtered to "my" campaigns
 #/c/upgrade-java?assessment=coverity            filters propagate through every drill-down
 ```
 
@@ -271,7 +280,7 @@ The entire app is a single `App.jsx` file (~3,400 lines) organized top-to-bottom
 11. Format helpers
 12. Hash routing (`parseHash`, `serializeHash`, `useRoute`)
 13. Global styles (CSS variables, fonts, scrollbar, animations)
-14. Small components (`SeverityBar`, `StatNum`, `SevDot`, `CritBadge`, `Sparkline`, `SlaBadge`, `Avatar`, `AvatarStack`, `PeoplePickerModal`, `CopyButton`, `FilterSelect`, `AssessmentFilter`, `AssessmentChip`, `AssessmentTag`, `FilteredEmptyState`, `ThemePicker`, `AssetMetaModal`, `YesNoBadge`, `StatusTag`)
+14. Small components (`SeverityBar`, `StatNum`, `SevDot`, `CritBadge`, `Sparkline`, `SlaBadge`, `Avatar`, `AvatarStack`, `PeoplePickerModal`, `CopyButton`, `FilterSelect`, `AssessmentFilter`, `AssessmentChip`, `AssessmentTag`, `FilteredEmptyState`, `MyCampaignsToggle`, `GlobalSearch`, `ThemePicker`, `AssetMetaModal`, `YesNoBadge`, `StatusTag`)
 15. Big components (`Header`, `SummaryBand`, `LensCard`, `LensesRow`, `TreemapCell`, `CampaignTreemap`, `BreakdownRow`, `BucketDetail`, `AssetDetail`, `FindingsView`, `EstimatesPanel`, `Footer`)
 16. `App` (default export) — routing wire-up, assignment state, `displayBuckets` / `displayHoursMap` / `displayWorld` memos that scale aggregates by the active assessment filter, modal mounts
 

@@ -58,6 +58,11 @@ const ORG = {
   internalDomain: 'internal',     // used for runbook.<x>, grafana.<x>, git.<x>, hostnames
 };
 
+// The "you" of the demo — used by the "Only my campaigns" filter on the
+// overview. Must match an `id` in the PEOPLE roster below. To make the demo
+// feel like someone else, change this to e.g. 'sam.okafor' or 'priya.patel'.
+const CURRENT_USER_ID = 'jane.doe';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THEMES  ─  registry. To add a theme: copy a block, rename the key, tweak the
 // hex values. Everything in `vars` becomes a CSS custom property on :root, and
@@ -744,6 +749,7 @@ function parseHash() {
   const theme = (themeParam && THEMES[themeParam]) ? themeParam : DEFAULT_THEME;
   const assessmentParam = params.get('assessment');
   const assessment = (assessmentParam && ASSESSMENT_TYPES[assessmentParam]) ? assessmentParam : 'all';
+  const onlyMine = params.get('mine') === '1';
   const parts = pathPart.split('/').filter(Boolean);
   let view = { kind: 'overview' };
   // /c/{bucket}/a/{asset}/findings
@@ -763,9 +769,9 @@ function parseHash() {
   } else if (parts[0] === 'c' && parts[1]) {
     view = { kind: 'bucket', bucketId: parts[1] };
   }
-  return { ...view, theme, assessment };
+  return { ...view, theme, assessment, onlyMine };
 }
-function serializeHash(view, theme, assessment) {
+function serializeHash(view, theme, assessment, onlyMine) {
   let path = '/';
   if (view.kind === 'bucket') path = `/c/${view.bucketId}`;
   else if (view.kind === 'asset') path = `/c/${view.bucketId}/a/${encodeURIComponent(view.assetId)}`;
@@ -777,6 +783,7 @@ function serializeHash(view, theme, assessment) {
   const qs = [];
   if (theme && theme !== DEFAULT_THEME) qs.push(`theme=${theme}`);
   if (assessment && assessment !== 'all') qs.push(`assessment=${assessment}`);
+  if (onlyMine) qs.push('mine=1');
   const q = qs.length ? `?${qs.join('&')}` : '';
   return `#${path}${q}`;
 }
@@ -791,15 +798,16 @@ function useRoute() {
       window.removeEventListener('popstate', onHash);
     };
   }, []);
-  const navigate = useCallback((nextView, nextTheme, nextAssessment) => {
+  const navigate = useCallback((nextView, nextTheme, nextAssessment, nextOnlyMine) => {
     const view = nextView ?? { kind: state.kind, bucketId: state.bucketId, assetId: state.assetId };
     const theme = nextTheme ?? state.theme;
     const assessment = nextAssessment ?? state.assessment;
-    const h = serializeHash(view, theme, assessment);
+    const onlyMine = nextOnlyMine !== undefined ? nextOnlyMine : state.onlyMine;
+    const h = serializeHash(view, theme, assessment, onlyMine);
     if (window.location.hash !== h) {
       window.location.hash = h; // triggers hashchange → setState
     } else {
-      setState({ ...view, theme, assessment });
+      setState({ ...view, theme, assessment, onlyMine });
     }
   }, [state]);
   return [state, navigate];
@@ -1360,8 +1368,263 @@ function FilteredEmptyState({ kind, label, assessment, onClearAssessment, onBack
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SPARKLINE — minimal SVG line + area
+// MY CAMPAIGNS TOGGLE — checkbox row above the Effort Map. Filters the
+// treemap (only) to campaigns the current user is assigned to. Shows the
+// user's avatar + name so it's clear who "you" are. Persisted in URL as
+// ?mine=1 alongside theme and assessment.
 // ─────────────────────────────────────────────────────────────────────────────
+function MyCampaignsToggle({ onlyMine, onChange, currentUser, mineCount, totalCount }) {
+  if (!currentUser) return null;
+  return (
+    <div style={{
+      padding: '14px 28px', display: 'flex', alignItems: 'center', gap: 14,
+      borderTop: `1px solid var(--border)`,
+    }}>
+      <label style={{
+        display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer',
+        fontSize: 13, color: 'var(--text)',
+      }}>
+        <input
+          type="checkbox"
+          checked={!!onlyMine}
+          onChange={(e) => onChange(e.target.checked)}
+          style={{ accentColor: 'var(--accent)', cursor: 'pointer', width: 14, height: 14 }}
+        />
+        <span>Only campaigns I'm assigned to</span>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <Avatar person={currentUser} size={20} />
+          <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>{currentUser.name}</span>
+        </span>
+      </label>
+      <span className="mono" style={{
+        fontSize: 11, color: 'var(--text-dim)', fontVariantNumeric: 'tabular-nums',
+        marginLeft: 4,
+      }}>
+        {onlyMine ? `${mineCount} of ${totalCount}` : `${totalCount} total`}
+      </span>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL SEARCH — header search input with live dropdown across assets
+// (id, hostname, IP) and campaigns (verb + noun). Click or Enter on a result
+// to navigate. Esc dismisses. Index is built once per (world, buckets) pair
+// so typing stays snappy across 5K assets.
+// ─────────────────────────────────────────────────────────────────────────────
+function GlobalSearch({ world, buckets, onJumpAsset, onJumpCampaign }) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const wrapRef = useRef(null);
+  const inputRef = useRef(null);
+
+  // Flat search index — built once. ~5K asset entries + 25 campaign entries.
+  // search field is pre-lowercased so we don't allocate strings per keystroke.
+  const index = useMemo(() => {
+    const entries = [];
+    buckets.forEach(b => {
+      const label = `${b.verb} ${b.noun}`;
+      entries.push({
+        kind: 'campaign', id: b.id,
+        label, sub: `${fmtNum(b.count)} findings · ~${fmtNum(b.affectedAssets)} assets`,
+        search: label.toLowerCase(),
+      });
+    });
+    world.assets.forEach(a => {
+      const m = a.meta || {};
+      const sub = [m.hostname, m.ip, a.criticality, a.env, a.team].filter(Boolean).join(' · ');
+      const search = `${a.id} ${m.hostname || ''} ${m.ip || ''} ${a.team || ''}`.toLowerCase();
+      entries.push({ kind: 'asset', id: a.id, label: a.id, sub, search });
+    });
+    return entries;
+  }, [world, buckets]);
+
+  const results = useMemo(() => {
+    const qLower = q.trim().toLowerCase();
+    if (qLower.length < 2) return [];
+    // Two-pass: prefix matches first, then substring matches. Cap at 12.
+    const prefix = [];
+    const substr = [];
+    for (let i = 0; i < index.length; i++) {
+      const e = index[i];
+      const pos = e.search.indexOf(qLower);
+      if (pos === 0) prefix.push(e);
+      else if (pos > 0) substr.push(e);
+      if (prefix.length >= 12) break;
+    }
+    const out = prefix.concat(substr).slice(0, 12);
+    // Tie-break: campaigns sort before assets when relevance is equal
+    out.sort((a, b) => {
+      const aP = a.search.startsWith(qLower) ? 0 : 1;
+      const bP = b.search.startsWith(qLower) ? 0 : 1;
+      if (aP !== bP) return aP - bP;
+      if (a.kind === b.kind) return 0;
+      return a.kind === 'campaign' ? -1 : 1;
+    });
+    return out;
+  }, [q, index]);
+
+  // Click outside dismisses dropdown.
+  useEffect(() => {
+    const onDoc = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, []);
+
+  // "/" anywhere on the page focuses the search field. Suppressed if the
+  // user is already typing in an input/textarea/contenteditable so it doesn't
+  // hijack normal text entry.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      const tag = t && t.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (t && t.isContentEditable) return;
+      e.preventDefault();
+      if (inputRef.current) {
+        inputRef.current.focus();
+        inputRef.current.select();
+      }
+      setOpen(true);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, []);
+
+  useEffect(() => { setHighlight(0); }, [q]);
+
+  const pick = (r) => {
+    if (!r) return;
+    setQ('');
+    setOpen(false);
+    if (inputRef.current) inputRef.current.blur();
+    if (r.kind === 'campaign') onJumpCampaign(r.id);
+    else if (r.kind === 'asset') onJumpAsset(r.id);
+  };
+
+  const onKeyDown = (e) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (results.length) setHighlight(h => Math.min(results.length - 1, h + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (results.length) setHighlight(h => Math.max(0, h - 1));
+    } else if (e.key === 'Enter') {
+      if (results.length) {
+        e.preventDefault();
+        pick(results[highlight] || results[0]);
+      }
+    } else if (e.key === 'Escape') {
+      setOpen(false);
+      if (inputRef.current) inputRef.current.blur();
+    }
+  };
+
+  const KindIcon = ({ kind }) => kind === 'campaign'
+    ? <Layers size={12} color="var(--accent)" />
+    : <Server size={12} color="var(--text-dim)" />;
+
+  return (
+    <div ref={wrapRef} style={{
+      position: 'relative', flex: '1 1 320px', minWidth: 220, maxWidth: 460,
+      marginLeft: 24, marginRight: 24,
+    }}>
+      <div style={{ position: 'relative' }}>
+        <Search size={13} color="var(--text-dim)" style={{
+          position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none',
+        }} />
+        <input
+          ref={inputRef}
+          type="text"
+          value={q}
+          onChange={(e) => { setQ(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={onKeyDown}
+          placeholder="Search assets, IPs, hostnames, campaigns…"
+          style={{
+            width: '100%', background: 'var(--surface-2)', color: 'var(--text)',
+            border: `1px solid var(--border)`, padding: '7px 28px 7px 30px',
+            fontSize: 12, fontFamily: 'inherit', outline: 'none',
+          }}
+        />
+        {q && (
+          <button
+            onClick={() => { setQ(''); if (inputRef.current) inputRef.current.focus(); }}
+            title="Clear"
+            style={{
+              position: 'absolute', right: 4, top: '50%', transform: 'translateY(-50%)',
+              background: 'transparent', border: 'none', color: 'var(--text-dim)',
+              cursor: 'pointer', padding: 4, display: 'flex', alignItems: 'center',
+            }}
+          >
+            <X size={12} />
+          </button>
+        )}
+        {!q && (
+          <span title="Press / to focus" className="mono" style={{
+            position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+            background: 'var(--bg)', color: 'var(--text-dim)',
+            border: `1px solid var(--border)`,
+            padding: '0 5px', fontSize: 10, lineHeight: '14px',
+            pointerEvents: 'none', userSelect: 'none',
+          }}>/</span>
+        )}
+      </div>
+      {open && results.length > 0 && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0,
+          background: 'var(--surface)', border: `1px solid var(--border-bright)`,
+          maxHeight: 360, overflowY: 'auto', zIndex: 20,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.12)',
+        }}>
+          {results.map((r, i) => (
+            <button
+              key={`${r.kind}-${r.id}`}
+              onMouseDown={(e) => { e.preventDefault(); pick(r); }}
+              onMouseEnter={() => setHighlight(i)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                padding: '8px 12px', background: i === highlight ? 'var(--surface-2)' : 'transparent',
+                border: 'none', borderBottom: i === results.length - 1 ? 'none' : `1px solid var(--border)`,
+                cursor: 'pointer', textAlign: 'left',
+              }}
+            >
+              <KindIcon kind={r.kind} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className={r.kind === 'asset' ? 'mono' : ''} style={{
+                  fontSize: 12, color: 'var(--text)',
+                  fontWeight: r.kind === 'campaign' ? 500 : 400,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>{r.label}</div>
+                <div style={{
+                  fontSize: 10, color: 'var(--text-dim)', marginTop: 2,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}>{r.sub}</div>
+              </div>
+              <span className="label" style={{ fontSize: 9, color: 'var(--text-faint)' }}>
+                {r.kind}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      {open && q.trim().length >= 2 && results.length === 0 && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0,
+          background: 'var(--surface)', border: `1px solid var(--border)`,
+          padding: '12px 14px', fontSize: 12, color: 'var(--text-dim)', zIndex: 20,
+        }}>
+          No matches for <span style={{ color: 'var(--text)' }}>"{q}"</span>.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Sparkline({ data, width = 140, height = 36, color = 'var(--accent)', showEnd = true }) {
   if (!data || data.length < 2) return null;
   const min = Math.min(...data);
@@ -1620,7 +1883,7 @@ function ThemePicker({ theme, onSelect }) {
   );
 }
 
-function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome }) {
+function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome, world, buckets, onJumpAsset, onJumpCampaign }) {
   return (
     <header style={{
       borderBottom: `1px solid var(--border)`,
@@ -1632,13 +1895,22 @@ function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, o
       position: 'sticky',
       top: 0,
       zIndex: 10,
+      gap: 16,
     }}>
-      <button onClick={onHome} style={{ background: 'transparent', border: 'none', padding: 0, display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text)' }}>
+      <button onClick={onHome} style={{ background: 'transparent', border: 'none', padding: 0, display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text)', flexShrink: 0 }}>
         <Layers size={22} color="var(--accent)" strokeWidth={1.5} />
         <span className="display" style={{ fontSize: 22, fontWeight: 500, letterSpacing: '0.04em' }}>{BRAND.name}</span>
         <span className="label" style={{ marginLeft: 4 }}>{BRAND.tagline}</span>
       </button>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+      {world && buckets && (
+        <GlobalSearch
+          world={world}
+          buckets={buckets}
+          onJumpAsset={onJumpAsset}
+          onJumpCampaign={onJumpCampaign}
+        />
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0 }}>
         <div style={{ display: 'flex', gap: 24 }}>
           <div>
             <span className="label">Findings</span>{' '}
@@ -1916,25 +2188,34 @@ function CampaignTreemap({ buckets, hoursMap, onPick, theme, assignmentsByBucket
         </div>
       </div>
       <div style={{ height: 520, border: `1px solid var(--border)`, background: 'var(--bg)' }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <Treemap data={data} dataKey="size" stroke={C.bg} isAnimationActive={false} content={<TreemapCell onPick={onPick} theme={theme} />}>
-            <Tooltip cursor={false} content={({ active, payload }) => {
-              if (!active || !payload || !payload[0]) return null;
-              const d = payload[0].payload;
-              if (!d || !d.verb) return null;
-              return (
-                <div style={{ background: 'var(--surface)', border: `1px solid var(--border-bright)`, padding: '10px 14px' }}>
-                  <div style={{ fontSize: 13, fontWeight: 500 }}>
-                    <span style={{ color: 'var(--text-dim)' }}>{d.verb}</span> {d.noun}
+        {data.length === 0 ? (
+          <div style={{
+            height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: 'var(--text-dim)', fontSize: 13, padding: 24, textAlign: 'center',
+          }}>
+            No campaigns match the current filters. Clear "Only my campaigns" or change the assessment source above to see more.
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <Treemap data={data} dataKey="size" stroke={C.bg} isAnimationActive={false} content={<TreemapCell onPick={onPick} theme={theme} />}>
+              <Tooltip cursor={false} content={({ active, payload }) => {
+                if (!active || !payload || !payload[0]) return null;
+                const d = payload[0].payload;
+                if (!d || !d.verb) return null;
+                return (
+                  <div style={{ background: 'var(--surface)', border: `1px solid var(--border-bright)`, padding: '10px 14px' }}>
+                    <div style={{ fontSize: 13, fontWeight: 500 }}>
+                      <span style={{ color: 'var(--text-dim)' }}>{d.verb}</span> {d.noun}
+                    </div>
+                    <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
+                      {fmtNum(d.count)} findings · {fmtHours(d.hours)}
+                    </div>
                   </div>
-                  <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
-                    {fmtNum(d.count)} findings · {fmtHours(d.hours)}
-                  </div>
-                </div>
-              );
-            }}/>
-          </Treemap>
-        </ResponsiveContainer>
+                );
+              }}/>
+            </Treemap>
+          </ResponsiveContainer>
+        )}
       </div>
     </div>
   );
@@ -3150,15 +3431,18 @@ export default function App() {
 
   // Per-campaign assignments — Map<bucketId, string[] personIds>.
   // Seed a handful so the demo shows the avatar overlay out of the box.
+  // CURRENT_USER_ID (jane.doe) appears on a few so the "Only my campaigns"
+  // filter on the overview has meaningful coverage.
   const [assignments, setAssignments] = useState(() => ({
-    'patch-log4j':       ['priya.patel', 'marcus.chen', 'sam.okafor', 'iris.tanaka'],
+    'patch-log4j':       ['priya.patel', 'marcus.chen', 'sam.okafor', 'iris.tanaka', 'jane.doe'],
     'upgrade-openssl':   ['priya.patel', 'akira.yamada'],
     'patch-apache':      ['lukas.mueller', 'sam.okafor'],
-    'upgrade-postgres':  ['noor.khan', 'chen.liu'],
-    'rotate-ssh':        ['derek.ross', 'maria.garcia', 'akira.yamada'],
+    'upgrade-postgres':  ['noor.khan', 'chen.liu', 'jane.doe'],
+    'rotate-ssh':        ['derek.ross', 'maria.garcia', 'akira.yamada', 'jane.doe'],
     'upgrade-k8s':       ['iris.tanaka', 'sam.okafor', 'lukas.mueller', 'derek.ross', 'akira.yamada'],
-    'enable-mfa':        ['jane.doe'],
+    'enable-mfa':        ['jane.doe', 'priya.patel'],
     'upgrade-rhel':      ['akira.yamada', 'maria.garcia'],
+    'configure-tls':     ['marcus.chen', 'jane.doe'],
   }));
   const [pickerBucketId, setPickerBucketId] = useState(null);
 
@@ -3287,6 +3571,23 @@ export default function App() {
     .map(id => PEOPLE_BY_ID.get(id)).filter(Boolean);
 
   const setAssessment = useCallback((next) => navigate(undefined, undefined, next), [navigate]);
+  const setOnlyMine = useCallback((next) => navigate(undefined, undefined, undefined, !!next), [navigate]);
+
+  const onlyMine = !!route.onlyMine;
+  const currentUser = PEOPLE_BY_ID.get(CURRENT_USER_ID) || null;
+
+  // Treemap-only filter: when "Only my campaigns" is on, hide buckets the
+  // current user isn't assigned to. Applied AFTER displayBuckets (assessment
+  // filter) so the two filters compose. Summary band and lens cards keep the
+  // org-wide view because they're navigational context, not "my work".
+  const treemapBuckets = useMemo(() => {
+    if (!onlyMine || !currentUser) return displayBuckets;
+    return displayBuckets.filter(b => (assignments[b.id] || []).includes(currentUser.id));
+  }, [displayBuckets, onlyMine, currentUser, assignments]);
+  const myCampaignsCount = useMemo(() => {
+    if (!currentUser) return 0;
+    return displayBuckets.filter(b => (assignments[b.id] || []).includes(currentUser.id)).length;
+  }, [displayBuckets, currentUser, assignments]);
 
   const selectedBucket = (route.kind === 'bucket' || route.kind === 'asset' || route.kind === 'findings')
     ? displayBuckets.find(b => b.id === route.bucketId) : null;
@@ -3318,6 +3619,17 @@ export default function App() {
         onSelectTheme={selectTheme}
         onSettings={() => setShowEstimates(true)}
         onHome={goOverview}
+        world={world}
+        buckets={buckets}
+        onJumpAsset={(aid) => {
+          // Jump to asset detail. Use the user's first campaign that affects
+          // this asset as the breadcrumb anchor; fall back to the first known
+          // campaign if none on the user's plate touch the asset.
+          const entries = world.assetFindings.get(aid) || [];
+          const bid = entries.length ? entries[0].bucketId : (buckets[0] && buckets[0].id);
+          if (bid) goAsset(aid, bid);
+        }}
+        onJumpCampaign={(bid) => goBucket(bid)}
       />
 
       {route.kind === 'overview' && (
@@ -3325,8 +3637,15 @@ export default function App() {
           <AssessmentFilter assessment={assessment} onChange={setAssessment} buckets={buckets} />
           <SummaryBand buckets={displayBuckets} totalHours={totalHours} burndown={displayWorld.burndowns.global} assessment={assessment} />
           <LensesRow buckets={displayBuckets} hoursMap={displayHoursMap} onPick={goBucket} />
+          <MyCampaignsToggle
+            onlyMine={onlyMine}
+            onChange={setOnlyMine}
+            currentUser={currentUser}
+            mineCount={myCampaignsCount}
+            totalCount={displayBuckets.length}
+          />
           <CampaignTreemap
-            buckets={displayBuckets} hoursMap={displayHoursMap} onPick={goBucket} theme={route.theme}
+            buckets={treemapBuckets} hoursMap={displayHoursMap} onPick={goBucket} theme={route.theme}
             assignmentsByBucket={peopleFor}
           />
           <Footer totalFindings={totalFindings} />

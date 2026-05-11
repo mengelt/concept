@@ -60,6 +60,22 @@ The landing surface, designed to answer "where do I focus today?" in a single sc
 - **"Only my campaigns" toggle.** A checkbox above the Effort Map filters the treemap to campaigns the current user (`CURRENT_USER_ID`, defaults to `jane.doe`) is assigned to. Shows a count like "4 of 25" next to the checkbox so it's clear what was filtered out. The summary band and lens cards stay org-wide on purpose — they're navigational context, not "my work." Persisted as `?mine=1` in the URL. Composes with the assessment filter: hidden buckets stay hidden in both modes.
 - **Effort Map (treemap).** All 25 campaigns sized by total effort hours, color-coded by dominant severity. The left strip on each cell encodes severity explicitly. Cells with assignees show a small avatar stack in the top-right corner; unassigned cells get a subtle dim strip along the bottom edge so "what isn't being worked" is scannable at a glance. Click a cell to drill in. Empty state appears when filters combine to hide every campaign, with a hint about which filter to clear.
 
+### Cockpit (overview alternate)
+
+A sibling page to Operations Brief, reachable via the **Ops Brief / Cockpit** segmented control in the header. Where the Brief asks *"where do I focus today?"*, the Cockpit asks *"what happened in this window?"* — it's the retrospective surface for understanding throughput.
+
+- **Range picker.** Preset pills for *7 days*, *30 days*, *90 days*, *6 months*, and *YTD*, plus a *Custom* button that reveals inline `from → to` date inputs. The active preset is highlighted; choosing a custom range that doesn't match any preset auto-reveals the date fields. Range is encoded in the URL as `?from=YYYY-MM-DD&to=YYYY-MM-DD` and is bookmarkable; default is the last 30 days. Composes with the global Sources filter — when sources are filtered, all flow numbers scale proportionally (same `globalScale` approach the burndown uses).
+- **Four headline tiles** — each carries a prior-period delta (same range length, immediately preceding the current window) color-coded green/red by whether the change is favorable:
+  - **Discovered.** New findings in the window. Lower is better.
+  - **Remediated.** Findings closed in the window. Higher is better.
+  - **Net flow.** *Discovered − Remediated*. Negative ≈ backlog shrinking (good), positive ≈ growing (bad); the tile color tracks the sign.
+  - **CAP Extensions.** Count of Corrective Action Plan extensions in the window, plus how many distinct campaigns they spanned.
+- **Discovery vs. Remediation chart.** A dual-line area chart over the range — red for discovered, green for remediated. Inline SVG, responsive to container width, hover anywhere to reveal a vertical tracker plus the day's exact values. Legend and live readout sit below the chart.
+- **Aging histogram.** Stacked-bar chart of *open* findings binned by age in days: *0–30, 30–60, 60–90, 90–120, 120–150, 150–180, 180+*. Each bar is segmented by severity (Critical on top, Low on bottom) so stale-and-dangerous stands out. Totals appear above each bar with percent-of-population below. This is a snapshot — it does **not** recompute when the range picker moves, because the question is "what does the open queue look like *right now?*". The bin proportions are derived analytically from `generateAge`'s piecewise probabilities (sampled 5K times per severity at module load) and then applied to each campaign's `sevCounts`.
+- **CAP activity.** A three-tile row (Created / Extended / Closed counts in range), followed by a two-column section: top 5 campaigns ranked by extensions in range, and a recent-activity feed (last 8 events, newest first).
+
+URL example: `#/cockpit?from=2026-02-10&to=2026-05-11&assessment=continuous` — three months of continuous-scan activity. Range params are silently dropped when navigating away from the cockpit so they don't dirty up unrelated URLs.
+
 ### Campaign Detail (bucket)
 
 What it would take to fully close a single campaign across all affected assets.
@@ -154,6 +170,8 @@ Hash-based routing so any view is bookmarkable and shareable:
 
 ```
 #/                                              overview
+#/cockpit                                       cockpit (defaults to last 30 days)
+#/cockpit?from=2026-02-10&to=2026-05-11         cockpit with explicit range
 #/c/patch-log4j                                 campaign detail
 #/c/patch-log4j/a/srv-prd-1042                  asset detail
 #/c/patch-log4j/findings                        all findings in a campaign
@@ -209,6 +227,12 @@ Importantly, hours scale **per affected asset**, not per finding. Patching Log4j
 ### Burndown timeseries
 90 days of mock data per scope (global / per campaign / per asset). Generated with an ease-in-out decline curve (faster early, asymptotic toward the floor) plus a weekly sinusoidal cycle and ~2% noise. Deterministic by seed, so the same asset always shows the same trend.
 
+### Cockpit data synthesis
+The Cockpit needs two things the base data model doesn't carry: a daily *discovery* and *remediation* flow, and a CAP event log. Both are synthesized deterministically at module load.
+
+- **Discovery / remediation flow.** 365 days of daily `{ discovered, remediated }` counts at the org-wide level, generated from the total finding count with a weekly cycle (discovery skews Mon/Tue, remediation Tue–Thu, weekend dip on both), occasional discovery spikes (~5% of days, a scanner burst), occasional remediation pushes (~7% of days, a patch sprint), and light noise. Tuned so cumulative remediation slightly outpaces cumulative discovery, matching the burndown narrative. The Cockpit slices into this array by date range and scales by `globalScale` when an assessment source is filtered.
+- **CAP log.** Each campaign gets 1–5 CAPs proportional to its affected-asset count. Each CAP has a creation date (30–365 days ago), 0–3 extensions sprinkled along its lifetime (each adding 7–67 days), and a 50% chance of being closed. All events carry a `daysAgo` field so the cockpit's range filter is a single inequality check.
+
 ### Assessment sources
 Six scanner types model the heterogeneous reality of where findings come from: **Continuous Scan** (Rapid7/Tenable-style network/host scanning), **Coverity** (SAST), **Configuration Audit** (CIS hardening / compliance), **Cloud Posture** (CSPM), **Penetration Test** (manual red-team), and **Dependency Scan** (SCA / supply chain). Each campaign carries a hand-authored `assessmentMix` — a probability distribution that sums to 1.0 — capturing the realistic blend of sources for that work. Log4j leans continuous + dependency; runtime upgrades (Java/Node/Python) carry meaningful Coverity share because SAST often catches related code-level bugs alongside the runtime CVE; TLS, MFA, and rotation campaigns lean config audit + pentest; cloud-adjacent campaigns (k8s, certs, TLS) pick up CSPM share. Per-finding assessment type is then drawn deterministically from this mix at materialization time, so any individual finding always reports the same source.
 
@@ -249,7 +273,8 @@ These are mockup gaps that would need real work for a production system:
 - **Campaign workflow state.** Campaigns are either *exists* or *doesn't*. No Planned / In Progress / Blocked / Done machinery at the campaign level yet. (Per-finding workflow status — Open / In Progress / Risk Accepted / Fixed / False Positive — is shown on the Findings view but is synthesized, not editable.)
 - **Risk-accept / exception flow.** No way to mark a finding as accepted-with-justification. The status is read-only.
 - **Cross-campaign bundling planner.** The asset detail page hints at it ("plan change window") but there's no flow for selecting N assets and dispatching a bundled work order.
-- **Corrective Action Plans (CAPs).** The Findings view has multi-select and "Add to CAP" / "Add to Existing CAP" buttons, but they're visual affordances only — no CAP data model, list of existing CAPs, or persistence behind them yet.
+- **Corrective Action Plans (CAPs).** The Findings view has multi-select and "Add to CAP" / "Add to Existing CAP" buttons, but they're visual affordances only — there's no CAP CRUD UI behind them. The Cockpit has a synthesized CAP event log (created / extended / closed events per campaign) just rich enough to drive the *Extensions in range* metric and a small activity feed; it isn't editable.
+- **Cockpit remediation events.** The Cockpit's *Discovered* and *Remediated* tiles count synthetic daily events from a generated flow timeseries, not real per-finding state transitions. A real system would derive these from the audit trail on each finding's status changes.
 - **Per-asset assignment.** Assignment is at the campaign level, not the asset level. Right granularity for now (the operational unit *is* the campaign) but if "Jane handles the prod databases, Marcus handles the apps" within a single campaign matters, that's a follow-up.
 - **Workload view across people.** "Show me everyone's queue, sorted by total hours." Genuinely useful but a new page.
 - **Assignment persistence.** Assignments live in component state and don't survive a page reload. Would need localStorage or a real backend.
@@ -265,23 +290,24 @@ These are mockup gaps that would need real work for a production system:
 
 ## File layout
 
-The entire app is a single `App.jsx` file (~3,400 lines) organized top-to-bottom as:
+The entire app is a single `App.jsx` file (~5,100 lines) organized top-to-bottom as:
 
 1. Imports
 2. **CONFIG** — `BRAND`, `ORG` constants
 3. **THEMES** registry + `applyThemeVars`, `cellPalette` helpers
 4. Seeded RNG and distribution helpers
 5. SLA policy + `slaStatus`, `generateAge`, `generateBurndown`
-6. **ASSESSMENT_TYPES** registry + per-bucket `ASSESSMENT_MIX_BY_BUCKET` + `bucketShare` helper
-7. Bucket definitions and aggregation builders
-8. Asset world builder (registry + reverse index + metadata + burndowns)
-9. **PEOPLE** roster + makePerson helper
-10. `materializeFindings` — expands an `(asset, bucket)` aggregate entry into individual finding records (id, CVE, KEV, POC, Priority Score, First Found, workflow status, assessment source)
-11. Format helpers
-12. Hash routing (`parseHash`, `serializeHash`, `useRoute`)
-13. Global styles (CSS variables, fonts, scrollbar, animations)
-14. Small components (`SeverityBar`, `StatNum`, `SevDot`, `CritBadge`, `Sparkline`, `SlaBadge`, `Avatar`, `AvatarStack`, `PeoplePickerModal`, `CopyButton`, `FilterSelect`, `AssessmentFilter`, `AssessmentChip`, `AssessmentTag`, `FilteredEmptyState`, `MyCampaignsToggle`, `GlobalSearch`, `ThemePicker`, `AssetMetaModal`, `YesNoBadge`, `StatusTag`)
-15. Big components (`Header`, `SummaryBand`, `LensCard`, `LensesRow`, `TreemapCell`, `CampaignTreemap`, `BreakdownRow`, `BucketDetail`, `AssetDetail`, `FindingsView`, `EstimatesPanel`, `Footer`)
-16. `App` (default export) — routing wire-up, assignment state, `displayBuckets` / `displayHoursMap` / `displayWorld` memos that scale aggregates by the active assessment filter, modal mounts
+6. **COCKPIT data synthesis** — `computeAgingHistogram`, `generateFlow`, `buildCapLog` and supporting aging-bin proportions
+7. **ASSESSMENT_TYPES** registry + per-bucket `ASSESSMENT_MIX_BY_BUCKET` + `bucketShare` helper
+8. Bucket definitions and aggregation builders
+9. Asset world builder (registry + reverse index + metadata + burndowns)
+10. **PEOPLE** roster + makePerson helper
+11. `materializeFindings` — expands an `(asset, bucket)` aggregate entry into individual finding records (id, CVE, KEV, POC, Priority Score, First Found, workflow status, assessment source)
+12. Format helpers
+13. Hash routing (`parseHash`, `serializeHash`, `useRoute`) — including cockpit view + `from`/`to` range params
+14. Global styles (CSS variables, fonts, scrollbar, animations)
+15. Small components (`SeverityBar`, `StatNum`, `SevDot`, `CritBadge`, `Sparkline`, `SlaBadge`, `Avatar`, `AvatarStack`, `PeoplePickerModal`, `CopyButton`, `FilterSelect`, `AssessmentFilter`, `AssessmentChip`, `AssessmentTag`, `FilteredEmptyState`, `MyCampaignsToggle`, `GlobalSearch`, `ThemePicker`, `AssetMetaModal`, `YesNoBadge`, `StatusTag`, `ViewToggle`)
+16. Big components (`Header`, `SummaryBand`, `LensCard`, `LensesRow`, `TreemapCell`, `CampaignTreemap`, `BreakdownRow`, `BucketDetail`, `AssetDetail`, `FindingsView`, `EstimatesPanel`, `CockpitView` + `RangePicker` / `CockpitTile` / `FlowChart` / `AgingHistogram` / `CapActivityStrip`, `Footer`)
+17. `App` (default export) — routing wire-up, assignment state, `displayBuckets` / `displayHoursMap` / `displayWorld` memos that scale aggregates by the active assessment filter, `globalScale` memo shared by cockpit, modal mounts
 
 Imports: React, Recharts (only the Treemap), Lucide icons. No other third-party dependencies.

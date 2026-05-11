@@ -8,7 +8,8 @@ import {
   Mail, Hash, MapPin, Tag as TagIcon, ExternalLink, Phone,
   Palette, Check, Copy, Users, UserPlus, Search,
   List, ListChecks, Plus, FilePlus,
-  Activity, Bug, ClipboardCheck, Cloud, Crosshair, Package, Filter
+  Activity, Bug, ClipboardCheck, Cloud, Crosshair, Package, Filter,
+  Gauge, TrendingUp, ArrowRight
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -283,6 +284,126 @@ function generateBurndown(currentCount, days, seed) {
   }
   out[out.length - 1] = currentCount;
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COCKPIT — aging histogram, discovery/remediation flow, CAP activity log
+//
+// All synthetic and seeded. Designed to back the Cockpit page which answers
+// "what happened in this window?" (rather than "where do I focus today?").
+// Kept deliberately simple: aging is derived analytically from generateAge's
+// piecewise probabilities, flow is a single global timeseries scaled by the
+// active assessment filter, and the CAP log is a small per-campaign event
+// stream over ~365 days.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Aging buckets — open findings binned by "age in days as of today". The
+// customer specifically asked for monthly granularity ("1 month, 2 months,
+// 3 months"); we extend to 6 months and then a long-tail "180d+" bin so the
+// stale backlog stays visible.
+const AGING_BIN_EDGES = [0, 30, 60, 90, 120, 150, 180, Infinity];
+const AGING_LABELS    = ['0–30d', '30–60d', '60–90d', '90–120d', '120–150d', '150–180d', '180d+'];
+
+function ageBinIndex(age) {
+  for (let i = 0; i < AGING_BIN_EDGES.length - 1; i++) {
+    if (age < AGING_BIN_EDGES[i + 1]) return i;
+  }
+  return AGING_BIN_EDGES.length - 2;
+}
+
+// Sample generateAge N times per severity to derive [sev][bin] proportions.
+// Done once at module load — deterministic.
+function computeAgingProportions() {
+  const N = 5000;
+  const rng = makeRng(0xA61A1A6E);
+  return [0, 1, 2, 3].map(sev => {
+    const counts = new Array(AGING_LABELS.length).fill(0);
+    for (let i = 0; i < N; i++) counts[ageBinIndex(generateAge(sev, rng))]++;
+    return counts.map(c => c / N);
+  });
+}
+const AGING_PROPS = computeAgingProportions();
+
+// Apply AGING_PROPS to a set of bucket sevCounts. Used by the cockpit to
+// render the org-wide aging histogram (and is composable with the assessment
+// filter — pass the already-scaled displayBuckets).
+function computeAgingHistogram(buckets) {
+  const totalSev = [0, 0, 0, 0];
+  buckets.forEach(b => b.sevCounts.forEach((c, i) => { totalSev[i] += c; }));
+  const bins = AGING_LABELS.map((label, binIdx) => {
+    const sevCounts = totalSev.map((tot, sev) => Math.round(tot * AGING_PROPS[sev][binIdx]));
+    return {
+      label,
+      start: AGING_BIN_EDGES[binIdx],
+      end: AGING_BIN_EDGES[binIdx + 1],
+      sevCounts,
+      total: sevCounts.reduce((a, b) => a + b, 0),
+    };
+  });
+  return { bins, total: bins.reduce((a, b) => a + b.total, 0) };
+}
+
+// Flow timeseries — 365 days of daily { discovered, remediated } counts at
+// the org-wide level. Today is at the end of each array. Tuned so cumulative
+// remediation slightly outpaces discovery (net backlog reduction), matching
+// the existing burndown narrative. Cockpit scales by globalScale to honor
+// the active assessment filter.
+const FLOW_DAYS = 365;
+function generateFlow(currentTotal, seed) {
+  const rng = makeRng(seed);
+  const discBase = currentTotal * 2.0 / FLOW_DAYS; // ~2x churn per year
+  const remBase  = currentTotal * 2.2 / FLOW_DAYS; // remediation outpaces discovery
+  const discovered = [];
+  const remediated = [];
+  for (let i = 0; i < FLOW_DAYS; i++) {
+    const dow = i % 7;
+    // discoveries spike Mon/Tue after weekend scans; weekend dip
+    let d = discBase * (1.0 + (dow < 2 ? 0.4 : 0) + (dow > 4 ? -0.5 : 0));
+    // remediations cluster Tue–Thu; weekend dip
+    let r = remBase * (1.0 + (dow >= 1 && dow <= 3 ? 0.4 : 0) + (dow > 4 ? -0.6 : 0));
+    // occasional scanner burst (5% of days) and patch push (7% of days)
+    if (rng() < 0.05) d += discBase * (3 + rng() * 4);
+    if (rng() < 0.07) r += remBase  * (2 + rng() * 3);
+    // light noise
+    d += (rng() - 0.5) * discBase * 0.4;
+    r += (rng() - 0.5) * remBase  * 0.4;
+    discovered.push(Math.max(0, Math.round(d)));
+    remediated.push(Math.max(0, Math.round(r)));
+  }
+  return { discovered, remediated };
+}
+
+// CAP (Corrective Action Plan) log — a small synthesized event stream per
+// campaign over ~365 days. Each CAP has a created event, 0–3 extensions, and
+// a 50% chance of being closed. Frequency correlates with campaign size so
+// the bigger campaigns naturally carry more CAP activity.
+function buildCapLog(buckets, seed) {
+  const rng = makeRng(seed);
+  const events = [];
+  let nextId = 1;
+  buckets.forEach(b => {
+    const capCount = Math.min(5, Math.max(1, Math.round(b.affectedAssets / 200)));
+    for (let i = 0; i < capCount; i++) {
+      const capId = `CAP-${String(nextId++).padStart(4, '0')}`;
+      const createdDaysAgo = 30 + Math.floor(rng() * 335);
+      events.push({ id: capId, campaignId: b.id, event: 'created', daysAgo: createdDaysAgo });
+      const extCount = Math.floor(rng() * 4); // 0–3
+      let lastDaysAgo = createdDaysAgo;
+      for (let j = 0; j < extCount; j++) {
+        const span = lastDaysAgo - 5;
+        if (span <= 0) break;
+        const extDaysAgo = lastDaysAgo - 5 - Math.floor(rng() * span);
+        const daysExtended = 7 + Math.floor(rng() * 60); // 1–9 weeks
+        events.push({ id: capId, campaignId: b.id, event: 'extended', daysAgo: extDaysAgo, daysExtended });
+        lastDaysAgo = extDaysAgo;
+      }
+      if (rng() < 0.5 && lastDaysAgo > 5) {
+        const closedDaysAgo = Math.max(0, lastDaysAgo - 5 - Math.floor(rng() * (lastDaysAgo - 5)));
+        events.push({ id: capId, campaignId: b.id, event: 'closed', daysAgo: closedDaysAgo });
+      }
+    }
+  });
+  return events;
 }
 
 // Verb-noun campaign definitions. Columns:
@@ -760,6 +881,9 @@ const fmtHoursDetail = (h) => {
 // HASH ROUTING — #/, #/c/{bucketId}, #/c/{bucketId}/findings,
 //   #/c/{bucketId}/a/{assetId}, #/c/{bucketId}/a/{assetId}/findings  (?theme=dark)
 // ─────────────────────────────────────────────────────────────────────────────
+function isValidIsoDate(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && !isNaN(Date.parse(s));
+}
 function parseHash() {
   const raw = (typeof window !== 'undefined' ? window.location.hash : '').slice(1) || '/';
   const [pathPart, queryPart] = raw.split('?');
@@ -778,10 +902,21 @@ function parseHash() {
     });
   }
   const onlyMine = params.get('mine') === '1';
+  // Cockpit date range — both YYYY-MM-DD or absent (the CockpitView fills in
+  // the default last-30-days when missing). Invalid values silently drop.
+  const fromParam = params.get('from');
+  const toParam   = params.get('to');
+  const range = {
+    from: isValidIsoDate(fromParam) ? fromParam : null,
+    to:   isValidIsoDate(toParam)   ? toParam   : null,
+  };
   const parts = pathPart.split('/').filter(Boolean);
   let view = { kind: 'overview' };
+  // /cockpit
+  if (parts[0] === 'cockpit') {
+    view = { kind: 'cockpit' };
   // /c/{bucket}/a/{asset}/findings
-  if (parts[0] === 'c' && parts[1] && parts[2] === 'a' && parts[3] && parts[parts.length - 1] === 'findings') {
+  } else if (parts[0] === 'c' && parts[1] && parts[2] === 'a' && parts[3] && parts[parts.length - 1] === 'findings') {
     view = {
       kind: 'findings',
       bucketId: parts[1],
@@ -797,11 +932,12 @@ function parseHash() {
   } else if (parts[0] === 'c' && parts[1]) {
     view = { kind: 'bucket', bucketId: parts[1] };
   }
-  return { ...view, theme, assessment, onlyMine };
+  return { ...view, theme, assessment, onlyMine, range };
 }
-function serializeHash(view, theme, assessment, onlyMine) {
+function serializeHash(view, theme, assessment, onlyMine, range) {
   let path = '/';
-  if (view.kind === 'bucket') path = `/c/${view.bucketId}`;
+  if (view.kind === 'cockpit') path = '/cockpit';
+  else if (view.kind === 'bucket') path = `/c/${view.bucketId}`;
   else if (view.kind === 'asset') path = `/c/${view.bucketId}/a/${encodeURIComponent(view.assetId)}`;
   else if (view.kind === 'findings') {
     path = view.assetId
@@ -812,6 +948,12 @@ function serializeHash(view, theme, assessment, onlyMine) {
   if (theme && theme !== DEFAULT_THEME) qs.push(`theme=${theme}`);
   if (assessment && assessment.size > 0) qs.push(`assessment=${[...assessment].join(',')}`);
   if (onlyMine) qs.push('mine=1');
+  // Range params only meaningful on the cockpit view; suppress elsewhere so
+  // they don't dirty up unrelated URLs.
+  if (view.kind === 'cockpit' && range) {
+    if (range.from) qs.push(`from=${range.from}`);
+    if (range.to)   qs.push(`to=${range.to}`);
+  }
   const q = qs.length ? `?${qs.join('&')}` : '';
   return `#${path}${q}`;
 }
@@ -826,16 +968,17 @@ function useRoute() {
       window.removeEventListener('popstate', onHash);
     };
   }, []);
-  const navigate = useCallback((nextView, nextTheme, nextAssessment, nextOnlyMine) => {
+  const navigate = useCallback((nextView, nextTheme, nextAssessment, nextOnlyMine, nextRange) => {
     const view = nextView ?? { kind: state.kind, bucketId: state.bucketId, assetId: state.assetId };
     const theme = nextTheme ?? state.theme;
     const assessment = nextAssessment ?? state.assessment;
     const onlyMine = nextOnlyMine !== undefined ? nextOnlyMine : state.onlyMine;
-    const h = serializeHash(view, theme, assessment, onlyMine);
+    const range = nextRange !== undefined ? nextRange : state.range;
+    const h = serializeHash(view, theme, assessment, onlyMine, range);
     if (window.location.hash !== h) {
       window.location.hash = h; // triggers hashchange → setState
     } else {
-      setState({ ...view, theme, assessment, onlyMine });
+      setState({ ...view, theme, assessment, onlyMine, range });
     }
   }, [state]);
   return [state, navigate];
@@ -2161,7 +2304,47 @@ function ThemePicker({ theme, onSelect }) {
   );
 }
 
-function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome, world, buckets, onJumpAsset, onJumpCampaign, onOpenSources, activeSourcesCount }) {
+// ─────────────────────────────────────────────────────────────────────────────
+// VIEW TOGGLE — Ops Brief / Cockpit segmented control in the Header
+// ─────────────────────────────────────────────────────────────────────────────
+function ViewToggle({ currentView, onSelect }) {
+  const tabs = [
+    { key: 'overview', label: 'Ops Brief', icon: Layers },
+    { key: 'cockpit',  label: 'Cockpit',   icon: Gauge },
+  ];
+  return (
+    <div style={{
+      display: 'inline-flex', border: `1px solid var(--border)`, flexShrink: 0,
+    }}>
+      {tabs.map((t, i) => {
+        const active = currentView === t.key;
+        const Icon = t.icon;
+        return (
+          <button
+            key={t.key}
+            onClick={() => !active && onSelect(t.key)}
+            style={{
+              background: active ? 'var(--surface)' : 'transparent',
+              border: 'none',
+              color: active ? 'var(--accent)' : 'var(--text-dim)',
+              padding: '7px 14px',
+              fontSize: 12, fontWeight: active ? 600 : 500,
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              borderRight: i < tabs.length - 1 ? '1px solid var(--border)' : 'none',
+              cursor: active ? 'default' : 'pointer',
+              letterSpacing: '0.02em',
+            }}
+          >
+            <Icon size={13} />
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, onHome, world, buckets, onJumpAsset, onJumpCampaign, onOpenSources, activeSourcesCount, currentView, onSelectView }) {
   return (
     <header style={{
       borderBottom: `1px solid var(--border)`,
@@ -2180,6 +2363,9 @@ function Header({ totalFindings, totalHours, theme, onSelectTheme, onSettings, o
         <span className="display" style={{ fontSize: 22, fontWeight: 500, letterSpacing: '0.04em' }}>{BRAND.name}</span>
         <span className="label" style={{ marginLeft: 4 }}>{BRAND.tagline}</span>
       </button>
+      {onSelectView && (
+        <ViewToggle currentView={currentView} onSelect={onSelectView} />
+      )}
       {world && buckets && (
         <GlobalSearch
           world={world}
@@ -3856,6 +4042,655 @@ function EstimatesPanel({ open, onClose, buckets, estimates, setEstimates, baseT
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// COCKPIT VIEW — range-scoped retrospective: discovered, remediated, aging,
+// CAP extensions. Sibling page to Operations Brief.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Date helpers. "Today" is captured once at module load (TODAY_MS) so the
+// page is stable across re-renders.
+const DAY_MS = 86400000;
+const TODAY_MIDNIGHT_MS = (() => {
+  const d = new Date(TODAY_MS); d.setHours(0, 0, 0, 0); return d.getTime();
+})();
+const TODAY_ISO = (() => {
+  const d = new Date(TODAY_MIDNIGHT_MS);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+})();
+function daysAgoToIso(n) {
+  const d = new Date(TODAY_MIDNIGHT_MS - n * DAY_MS);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function isoToDaysAgo(iso) {
+  if (!iso) return 0;
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(y, m - 1, d); dt.setHours(0, 0, 0, 0);
+  return Math.round((TODAY_MIDNIGHT_MS - dt.getTime()) / DAY_MS);
+}
+function fmtDateShort(iso) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+function fmtDateLong(iso) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+function niceCeil(v) {
+  if (v <= 0) return 1;
+  const exp = Math.pow(10, Math.floor(Math.log10(v)));
+  const m = v / exp;
+  if (m <= 1) return 1 * exp;
+  if (m <= 2) return 2 * exp;
+  if (m <= 5) return 5 * exp;
+  return 10 * exp;
+}
+
+const COCKPIT_PRESETS = [
+  { key: '7d',  label: '7 days',   days: 7   },
+  { key: '30d', label: '30 days',  days: 30  },
+  { key: '90d', label: '90 days',  days: 90  },
+  { key: '6mo', label: '6 months', days: 180 },
+  { key: 'ytd', label: 'YTD',      days: null },
+];
+
+function resolveCockpitRange(range) {
+  const to   = (range && range.to)   ? range.to   : TODAY_ISO;
+  const from = (range && range.from) ? range.from : daysAgoToIso(30);
+  return { from, to };
+}
+function rangeMatchesPreset(from, to) {
+  if (to !== TODAY_ISO) return null;
+  const fromDA = isoToDaysAgo(from);
+  for (const p of COCKPIT_PRESETS) {
+    if (p.days != null && p.days === fromDA) return p.key;
+    if (p.key === 'ytd') {
+      const y = new Date(TODAY_MIDNIGHT_MS).getFullYear();
+      if (from === `${y}-01-01`) return p.key;
+    }
+  }
+  return null;
+}
+
+// ─── Range picker — preset pills + custom inline date inputs
+function RangePicker({ from, to, onChange }) {
+  const activePreset = rangeMatchesPreset(from, to);
+  const [showCustom, setShowCustom] = useState(activePreset == null);
+
+  const applyPreset = (preset) => {
+    let newFrom, newTo;
+    if (preset.key === 'ytd') {
+      const y = new Date(TODAY_MIDNIGHT_MS).getFullYear();
+      newFrom = `${y}-01-01`;
+      newTo = TODAY_ISO;
+    } else {
+      newTo = TODAY_ISO;
+      newFrom = daysAgoToIso(preset.days);
+    }
+    onChange({ from: newFrom, to: newTo });
+    setShowCustom(false);
+  };
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+      <span className="label" style={{ marginRight: 4 }}>Range</span>
+      {COCKPIT_PRESETS.map(p => {
+        const active = activePreset === p.key;
+        return (
+          <button key={p.key} onClick={() => applyPreset(p)} className="card-hover" style={{
+            background: active ? 'var(--accent)' : 'transparent',
+            color: active ? '#fff' : 'var(--text)',
+            border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
+            padding: '5px 12px',
+            fontSize: 12, fontWeight: active ? 600 : 400,
+            cursor: 'pointer', letterSpacing: '0.02em',
+          }}>
+            {p.label}
+          </button>
+        );
+      })}
+      <button onClick={() => setShowCustom(s => !s)} className="card-hover" style={{
+        background: (showCustom && !activePreset) ? 'var(--surface)' : 'transparent',
+        color: 'var(--text)',
+        border: `1px solid var(--border)`,
+        padding: '5px 12px',
+        fontSize: 12,
+        cursor: 'pointer',
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+      }}>
+        <Calendar size={12} /> Custom
+      </button>
+      {(showCustom || !activePreset) && (
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: 8,
+          padding: '4px 10px', background: 'var(--surface)', border: `1px solid var(--border)`,
+        }}>
+          <input
+            type="date" value={from} max={to}
+            onChange={e => e.target.value && onChange({ from: e.target.value, to })}
+            style={{
+              background: 'transparent', border: 'none', color: 'var(--text)',
+              fontFamily: 'inherit', fontSize: 12, padding: 2, colorScheme: 'auto',
+            }}
+          />
+          <span style={{ color: 'var(--text-dim)' }}>→</span>
+          <input
+            type="date" value={to} min={from} max={TODAY_ISO}
+            onChange={e => e.target.value && onChange({ from, to: e.target.value })}
+            style={{
+              background: 'transparent', border: 'none', color: 'var(--text)',
+              fontFamily: 'inherit', fontSize: 12, padding: 2, colorScheme: 'auto',
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Headline tile with optional prior-period delta
+function CockpitTile({ icon: Icon, label, value, sub, delta, deltaMode, accent }) {
+  let deltaColor = 'var(--text-dim)';
+  let DeltaIcon = null;
+  if (delta != null && deltaMode !== 'neutral') {
+    if (deltaMode === 'higher-is-better') {
+      deltaColor = delta > 0 ? 'var(--good)' : delta < 0 ? 'var(--sev-critical)' : 'var(--text-dim)';
+    } else if (deltaMode === 'lower-is-better') {
+      deltaColor = delta > 0 ? 'var(--sev-critical)' : delta < 0 ? 'var(--good)' : 'var(--text-dim)';
+    }
+    DeltaIcon = delta > 0 ? TrendingUp : delta < 0 ? TrendingDown : null;
+  }
+  const deltaTxt = delta == null
+    ? null
+    : (Number.isFinite(delta) ? `${delta > 0 ? '+' : ''}${Math.round(delta)}%` : '—');
+  return (
+    <div style={{
+      padding: '20px',
+      background: 'var(--surface)',
+      border: `1px solid var(--border)`,
+      display: 'flex', flexDirection: 'column', gap: 6,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-dim)' }}>
+        {Icon && <Icon size={13} />}
+        <span className="label">{label}</span>
+      </div>
+      <div className="mono" style={{ fontSize: 30, fontWeight: 500, color: accent || 'var(--text)', lineHeight: 1.05 }}>
+        {value}
+      </div>
+      {sub && <div style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>{sub}</div>}
+      {delta != null && (
+        <div style={{
+          display: 'inline-flex', alignItems: 'center', gap: 5,
+          fontSize: 11, color: deltaColor, fontWeight: 500, marginTop: 2,
+        }}>
+          {DeltaIcon && <DeltaIcon size={11} />}
+          <span className="mono">{deltaTxt}</span>
+          <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>vs prior period</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Discovery / Remediation dual-line chart (inline SVG, responsive)
+function FlowChart({ discovered, remediated, dates }) {
+  const wrapRef = useRef(null);
+  const [w, setW] = useState(900);
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const update = () => { if (wrapRef.current) setW(wrapRef.current.offsetWidth); };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const [hoverX, setHoverX] = useState(null);
+
+  const n = discovered.length;
+  const H = 240;
+  const padL = 52, padR = 20, padT = 16, padB = 32;
+
+  if (n < 1) {
+    return <div ref={wrapRef} style={{ color: 'var(--text-dim)', fontSize: 13, padding: '20px 0' }}>No data in range.</div>;
+  }
+
+  const maxV = Math.max(1, ...discovered, ...remediated);
+  const yMax = niceCeil(maxV);
+
+  const x = (i) => padL + (n === 1 ? (w - padL - padR) / 2 : (i / (n - 1)) * (w - padL - padR));
+  const y = (v) => H - padB - (v / yMax) * (H - padT - padB);
+
+  const pathFor = (arr) => arr.map((v, i) => `${i === 0 ? 'M' : 'L'} ${x(i).toFixed(2)} ${y(v).toFixed(2)}`).join(' ');
+  const areaFor = (arr) => `${pathFor(arr)} L ${x(n - 1).toFixed(2)} ${H - padB} L ${x(0).toFixed(2)} ${H - padB} Z`;
+
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(p => Math.round(yMax * p));
+  const xTickIdxs = n <= 8
+    ? Array.from({ length: n }, (_, i) => i)
+    : [0, Math.floor(n * 0.25), Math.floor(n * 0.5), Math.floor(n * 0.75), n - 1];
+
+  const onMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const localX = ((e.clientX - rect.left) / rect.width) * w;
+    setHoverX(localX);
+  };
+  const onLeave = () => setHoverX(null);
+
+  let hoverIdx = null;
+  if (hoverX != null && n > 0) {
+    const inner = w - padL - padR;
+    if (n === 1) hoverIdx = 0;
+    else hoverIdx = Math.max(0, Math.min(n - 1, Math.round(((hoverX - padL) / inner) * (n - 1))));
+  }
+
+  return (
+    <div ref={wrapRef} style={{ width: '100%' }}>
+      <svg
+        width={w} height={H}
+        style={{ display: 'block' }}
+        onMouseMove={onMove}
+        onMouseLeave={onLeave}
+      >
+        {yTicks.map((tick, i) => (
+          <g key={i}>
+            <line x1={padL} x2={w - padR} y1={y(tick)} y2={y(tick)}
+                  stroke="var(--border)" strokeDasharray="2 4" strokeWidth={0.5} />
+            <text x={padL - 8} y={y(tick) + 3} fontSize="9.5" fill="var(--text-dim)" textAnchor="end" fontFamily="JetBrains Mono, monospace">
+              {fmtNum(tick)}
+            </text>
+          </g>
+        ))}
+        {xTickIdxs.map(i => (
+          <text key={i} x={x(i)} y={H - padB + 16} fontSize="10" fill="var(--text-dim)" textAnchor="middle">
+            {fmtDateShort(dates[i])}
+          </text>
+        ))}
+        {n >= 2 && (
+          <>
+            <path d={areaFor(remediated)} fill="var(--good)" opacity={0.10} />
+            <path d={pathFor(remediated)} fill="none" stroke="var(--good)" strokeWidth={1.6} strokeLinejoin="round" />
+            <path d={areaFor(discovered)} fill="var(--sev-critical)" opacity={0.07} />
+            <path d={pathFor(discovered)} fill="none" stroke="var(--sev-critical)" strokeWidth={1.6} strokeLinejoin="round" />
+          </>
+        )}
+        {n === 1 && (
+          <>
+            <circle cx={x(0)} cy={y(remediated[0])} r={4} fill="var(--good)" />
+            <circle cx={x(0)} cy={y(discovered[0])} r={4} fill="var(--sev-critical)" />
+          </>
+        )}
+        {hoverIdx != null && n >= 2 && (
+          <g>
+            <line x1={x(hoverIdx)} x2={x(hoverIdx)} y1={padT} y2={H - padB}
+                  stroke="var(--text-dim)" strokeWidth={0.5} strokeDasharray="3 3" />
+            <circle cx={x(hoverIdx)} cy={y(discovered[hoverIdx])} r={3.5} fill="var(--sev-critical)" />
+            <circle cx={x(hoverIdx)} cy={y(remediated[hoverIdx])} r={3.5} fill="var(--good)" />
+          </g>
+        )}
+      </svg>
+      <div style={{ marginTop: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+        <div style={{ display: 'flex', gap: 18 }}>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+            <span style={{ width: 14, height: 2, background: 'var(--sev-critical)' }} />
+            <span className="label" style={{ marginBottom: 0 }}>Discovered</span>
+          </div>
+          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+            <span style={{ width: 14, height: 2, background: 'var(--good)' }} />
+            <span className="label" style={{ marginBottom: 0 }}>Remediated</span>
+          </div>
+        </div>
+        {hoverIdx != null && (
+          <div className="mono" style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+            {fmtDateShort(dates[hoverIdx])}
+            {' · '}
+            <span style={{ color: 'var(--sev-critical)' }}>{fmtNum(discovered[hoverIdx])}</span>
+            {' / '}
+            <span style={{ color: 'var(--good)' }}>{fmtNum(remediated[hoverIdx])}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Stacked-bar aging histogram (open findings by age, segmented by severity)
+function AgingHistogram({ histogram }) {
+  const wrapRef = useRef(null);
+  const [w, setW] = useState(900);
+  useEffect(() => {
+    if (!wrapRef.current) return;
+    const update = () => { if (wrapRef.current) setW(wrapRef.current.offsetWidth); };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(wrapRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const H = 280;
+  const padL = 52, padR = 20, padT = 20, padB = 44;
+  const bins = histogram.bins;
+  const n = bins.length;
+  const maxTotal = Math.max(1, ...bins.map(b => b.total));
+  const yMax = niceCeil(maxTotal);
+
+  const innerW = w - padL - padR;
+  const innerH = H - padT - padB;
+  const gap = 10;
+  const barW = Math.max(8, (innerW - gap * (n - 1)) / n);
+  const x = (i) => padL + i * (barW + gap);
+  const y = (v) => padT + innerH - (v / yMax) * innerH;
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(p => Math.round(yMax * p));
+
+  // Stack order bottom→top: Low, Medium, High, Critical (critical stays on top visually)
+  const sevOrder = [3, 2, 1, 0];
+
+  return (
+    <div ref={wrapRef} style={{ width: '100%' }}>
+      <svg width={w} height={H} style={{ display: 'block' }}>
+        {yTicks.map((tick, i) => (
+          <g key={i}>
+            <line x1={padL} x2={w - padR} y1={y(tick)} y2={y(tick)}
+                  stroke="var(--border)" strokeDasharray="2 4" strokeWidth={0.5} />
+            <text x={padL - 8} y={y(tick) + 3} fontSize="9.5" fill="var(--text-dim)" textAnchor="end" fontFamily="JetBrains Mono, monospace">
+              {fmtNum(tick)}
+            </text>
+          </g>
+        ))}
+        {bins.map((bin, i) => {
+          let yCursor = y(0);
+          const segs = sevOrder.map(sev => {
+            const v = bin.sevCounts[sev];
+            const segH = (v / yMax) * innerH;
+            const yTop = yCursor - segH;
+            const seg = { sev, v, yTop, segH };
+            yCursor = yTop;
+            return seg;
+          });
+          return (
+            <g key={i}>
+              {segs.map(s => (
+                s.v > 0 ? (
+                  <rect key={s.sev} x={x(i)} y={s.yTop} width={barW} height={s.segH} fill={SEV_COLOR[s.sev]} />
+                ) : null
+              ))}
+              <text x={x(i) + barW / 2} y={y(bin.total) - 6} fontSize="11" fill="var(--text)"
+                    textAnchor="middle" fontFamily="JetBrains Mono, monospace" fontWeight="500">
+                {fmtNum(bin.total)}
+              </text>
+              <text x={x(i) + barW / 2} y={H - padB + 16} fontSize="10" fill="var(--text-dim)" textAnchor="middle">
+                {bin.label}
+              </text>
+              <text x={x(i) + barW / 2} y={H - padB + 30} fontSize="9" fill="var(--text-faint)" textAnchor="middle">
+                {((bin.total / Math.max(1, histogram.total)) * 100).toFixed(0)}%
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// ─── CAP activity in range — top campaigns + recent events
+function CapActivityStrip({ events, fromDaysAgo, toDaysAgo, buckets }) {
+  const inRange = events.filter(e => e.daysAgo <= fromDaysAgo && e.daysAgo >= toDaysAgo);
+  const extended = inRange.filter(e => e.event === 'extended');
+  const extByCampaign = {};
+  extended.forEach(e => { extByCampaign[e.campaignId] = (extByCampaign[e.campaignId] || 0) + 1; });
+  const topExt = Object.entries(extByCampaign).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const bucketMap = Object.fromEntries(buckets.map(b => [b.id, b]));
+  const recent = [...inRange].sort((a, b) => a.daysAgo - b.daysAgo).slice(0, 8);
+
+  const created = inRange.filter(e => e.event === 'created').length;
+  const closed  = inRange.filter(e => e.event === 'closed').length;
+
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 24 }}>
+        <div style={{ padding: '14px 16px', background: 'var(--surface)', border: `1px solid var(--border)` }}>
+          <div className="label" style={{ marginBottom: 6 }}>Created</div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, color: 'var(--accent)' }}>{fmtNum(created)}</div>
+        </div>
+        <div style={{ padding: '14px 16px', background: 'var(--surface)', border: `1px solid var(--border)` }}>
+          <div className="label" style={{ marginBottom: 6 }}>Extended</div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, color: 'var(--sev-medium)' }}>{fmtNum(extended.length)}</div>
+        </div>
+        <div style={{ padding: '14px 16px', background: 'var(--surface)', border: `1px solid var(--border)` }}>
+          <div className="label" style={{ marginBottom: 6 }}>Closed</div>
+          <div className="mono" style={{ fontSize: 22, fontWeight: 500, color: 'var(--good)' }}>{fmtNum(closed)}</div>
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 32 }}>
+        <div>
+          <div className="label" style={{ marginBottom: 10 }}>Top campaigns by CAP extensions</div>
+          {topExt.length === 0 ? (
+            <div style={{ color: 'var(--text-dim)', fontSize: 13, padding: '20px 0' }}>No CAP extensions in this range.</div>
+          ) : (
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <tbody>
+                {topExt.map(([cid, count]) => {
+                  const b = bucketMap[cid];
+                  if (!b) return null;
+                  return (
+                    <tr key={cid} style={{ borderBottom: `1px solid var(--border)` }}>
+                      <td style={{ padding: '8px 0' }}>
+                        <span style={{ color: 'var(--text-dim)' }}>{b.verb}</span>{' '}
+                        <span style={{ color: 'var(--text)' }}>{b.noun}</span>
+                      </td>
+                      <td className="mono" style={{ padding: '8px 0', textAlign: 'right', width: 60, color: 'var(--sev-medium)', fontWeight: 500 }}>
+                        {count}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+        <div>
+          <div className="label" style={{ marginBottom: 10 }}>Recent activity</div>
+          {recent.length === 0 ? (
+            <div style={{ color: 'var(--text-dim)', fontSize: 13, padding: '20px 0' }}>No activity in range.</div>
+          ) : (
+            <ul style={{ listStyle: 'none', padding: 0, margin: 0, fontSize: 11.5 }}>
+              {recent.map((e, i) => (
+                <li key={i} style={{
+                  padding: '7px 0', borderBottom: `1px solid var(--border)`,
+                  display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'baseline',
+                }}>
+                  <span>
+                    <span className="mono" style={{ color: 'var(--text-dim)' }}>{e.id}</span>{' '}
+                    <span style={{
+                      color: e.event === 'extended' ? 'var(--sev-medium)'
+                           : e.event === 'closed'   ? 'var(--good)'
+                           : 'var(--accent)',
+                      fontWeight: 500, textTransform: 'lowercase',
+                    }}>
+                      {e.event}
+                    </span>
+                    {e.event === 'extended' && (
+                      <span className="mono" style={{ color: 'var(--text-dim)' }}> +{e.daysExtended}d</span>
+                    )}
+                  </span>
+                  <span className="mono" style={{ color: 'var(--text-dim)' }}>{fmtDateShort(daysAgoToIso(e.daysAgo))}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main cockpit view
+function CockpitView({ range, onSetRange, displayBuckets, flow, capLog, globalScale, assessment, onClearAssessment }) {
+  const resolved = useMemo(() => resolveCockpitRange(range), [range && range.from, range && range.to]);
+  const { from, to } = resolved;
+
+  const fromDaysAgo = isoToDaysAgo(from);
+  const toDaysAgo   = isoToDaysAgo(to);
+  const rangeLen = Math.max(1, fromDaysAgo - toDaysAgo + 1);
+
+  const sliceFlow = (fromDA, toDA) => {
+    const lo = Math.max(0, FLOW_DAYS - 1 - fromDA);
+    const hi = Math.min(FLOW_DAYS - 1, FLOW_DAYS - 1 - toDA);
+    if (hi < lo) return { discovered: [], remediated: [] };
+    return {
+      discovered: flow.discovered.slice(lo, hi + 1),
+      remediated: flow.remediated.slice(lo, hi + 1),
+    };
+  };
+
+  const cur = sliceFlow(fromDaysAgo, toDaysAgo);
+  const curDiscovered = cur.discovered.map(v => Math.round(v * globalScale));
+  const curRemediated = cur.remediated.map(v => Math.round(v * globalScale));
+  const curDates = Array.from(
+    { length: curDiscovered.length },
+    (_, i) => daysAgoToIso(fromDaysAgo - i),
+  );
+
+  const sumDiscovered = curDiscovered.reduce((a, b) => a + b, 0);
+  const sumRemediated = curRemediated.reduce((a, b) => a + b, 0);
+  const netFlow = sumDiscovered - sumRemediated;
+
+  // Prior period — equal length, immediately preceding `from`
+  const priorFromDA = fromDaysAgo + rangeLen;
+  const priorToDA   = fromDaysAgo + 1;
+  const prior = sliceFlow(priorFromDA, priorToDA);
+  const priorDiscovered = Math.round(prior.discovered.reduce((a, b) => a + b, 0) * globalScale);
+  const priorRemediated = Math.round(prior.remediated.reduce((a, b) => a + b, 0) * globalScale);
+  const priorNet = priorDiscovered - priorRemediated;
+
+  const pct = (curr, prev) => {
+    if (prev === 0 || prev == null) return null;
+    return ((curr - prev) / Math.abs(prev)) * 100;
+  };
+  const deltaDiscovered = pct(sumDiscovered, priorDiscovered);
+  const deltaRemediated = pct(sumRemediated, priorRemediated);
+  const deltaNet        = pct(netFlow, priorNet);
+
+  // CAPs — filter list to range, then compute counts and prior-period extension count
+  const eventsInRange = capLog.filter(e => e.daysAgo <= fromDaysAgo && e.daysAgo >= toDaysAgo);
+  const extensionsInRange = eventsInRange.filter(e => e.event === 'extended').length;
+  const priorEventsInRange = capLog.filter(e => e.daysAgo <= priorFromDA && e.daysAgo >= priorToDA);
+  const priorExtensions = priorEventsInRange.filter(e => e.event === 'extended').length;
+  const deltaExtensions = pct(extensionsInRange, priorExtensions);
+  const campaignsWithExt = new Set(
+    eventsInRange.filter(e => e.event === 'extended').map(e => e.campaignId),
+  ).size;
+
+  // Aging histogram — snapshot of *open* findings as of today
+  const aging = useMemo(() => computeAgingHistogram(displayBuckets), [displayBuckets]);
+
+  const netLabel = netFlow < 0 ? 'backlog shrinking'
+                 : netFlow > 0 ? 'backlog growing'
+                 : 'steady state';
+
+  return (
+    <div className="fade-in">
+      {/* Header band — title + range picker + assessment chip */}
+      <div style={{ borderBottom: `1px solid var(--border)`, padding: '32px 28px 26px' }} className="grain">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16 }}>
+          <div>
+            <div className="label" style={{ marginBottom: 10 }}>Cockpit · Range Activity</div>
+            <h1 className="display" style={{
+              fontSize: 26, fontWeight: 400, lineHeight: 1.2, margin: 0, color: 'var(--text)',
+            }}>
+              <span style={{ color: 'var(--accent)', fontStyle: 'italic' }}>{rangeLen}</span> day{rangeLen === 1 ? '' : 's'}
+              <span className="mono" style={{ fontSize: 18, marginLeft: 14, color: 'var(--text-dim)' }}>
+                {fmtDateLong(from)} → {fmtDateLong(to)}
+              </span>
+            </h1>
+          </div>
+        </div>
+        <div style={{ marginTop: 18 }}>
+          <RangePicker from={from} to={to} onChange={onSetRange} />
+        </div>
+        {assessment.size > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <AssessmentChip assessment={assessment} onClear={onClearAssessment} />
+          </div>
+        )}
+      </div>
+
+      {/* Headline tiles */}
+      <div style={{ padding: '28px', display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
+        <CockpitTile
+          icon={Plus} label="Discovered"
+          value={fmtNum(sumDiscovered)}
+          sub="new findings in window"
+          delta={deltaDiscovered}
+          deltaMode="lower-is-better"
+          accent="var(--sev-critical)"
+        />
+        <CockpitTile
+          icon={Check} label="Remediated"
+          value={fmtNum(sumRemediated)}
+          sub="findings closed in window"
+          delta={deltaRemediated}
+          deltaMode="higher-is-better"
+          accent="var(--good)"
+        />
+        <CockpitTile
+          icon={ArrowRight} label="Net Flow"
+          value={(netFlow >= 0 ? '+' : '') + fmtNum(netFlow)}
+          sub={netLabel}
+          delta={deltaNet}
+          deltaMode="lower-is-better"
+          accent={netFlow < 0 ? 'var(--good)' : netFlow > 0 ? 'var(--sev-critical)' : 'var(--text)'}
+        />
+        <CockpitTile
+          icon={ClipboardCheck} label="CAP Extensions"
+          value={fmtNum(extensionsInRange)}
+          sub={`across ${campaignsWithExt} campaign${campaignsWithExt === 1 ? '' : 's'}`}
+          delta={deltaExtensions}
+          deltaMode="lower-is-better"
+          accent="var(--accent)"
+        />
+      </div>
+
+      {/* Flow chart */}
+      <div style={{ borderTop: `1px solid var(--border)`, padding: '28px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+          <div className="label">Discovery vs. Remediation</div>
+          <div className="label" style={{ color: 'var(--text-faint)' }}>daily counts · {rangeLen} day{rangeLen === 1 ? '' : 's'}</div>
+        </div>
+        <FlowChart discovered={curDiscovered} remediated={curRemediated} dates={curDates} />
+      </div>
+
+      {/* Aging histogram */}
+      <div style={{ borderTop: `1px solid var(--border)`, padding: '28px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+          <div className="label">Open findings · age distribution</div>
+          <div className="label" style={{ color: 'var(--text-faint)' }}>snapshot · {fmtDateLong(TODAY_ISO)} · {fmtNum(aging.total)} open</div>
+        </div>
+        <AgingHistogram histogram={aging} />
+        <div style={{ display: 'flex', gap: 18, marginTop: 8, justifyContent: 'center' }}>
+          {SEV.map((s, i) => (
+            <div key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
+              <span style={{ width: 10, height: 10, background: SEV_COLOR[i], display: 'inline-block' }} />
+              <span className="label" style={{ marginBottom: 0 }}>{s}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* CAP activity */}
+      <div style={{ borderTop: `1px solid var(--border)`, padding: '28px' }}>
+        <div className="label" style={{ marginBottom: 16 }}>CAP activity in range</div>
+        <CapActivityStrip
+          events={capLog}
+          fromDaysAgo={fromDaysAgo}
+          toDaysAgo={toDaysAgo}
+          buckets={displayBuckets}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // FOOTER
 // ─────────────────────────────────────────────────────────────────────────────
 function Footer({ totalFindings }) {
@@ -3873,6 +4708,15 @@ function Footer({ totalFindings }) {
 export default function App() {
   const buckets = useMemo(() => buildBuckets(), []);
   const world = useMemo(() => buildAssetWorld(buckets), [buckets]);
+  // Cockpit data — synthesized once, deterministic. Flow is org-wide and gets
+  // scaled by globalScale when the assessment filter narrows. CAP log is a
+  // small per-campaign event stream over ~365 days.
+  const totalCountUnfiltered = useMemo(
+    () => buckets.reduce((acc, b) => acc + b.count, 0),
+    [buckets],
+  );
+  const flow = useMemo(() => generateFlow(totalCountUnfiltered, 0xF10A1234), [totalCountUnfiltered]);
+  const capLog = useMemo(() => buildCapLog(buckets, 0xCAB10903), [buckets]);
   const [estimates, setEstimates] = useState({});
   const [route, navigate] = useRoute();
   const [showEstimates, setShowEstimates] = useState(false);
@@ -3969,6 +4813,16 @@ export default function App() {
     return m;
   }, [hoursMap, displayBuckets, assessment]);
 
+  // Global share across all buckets under the active assessment filter. Used
+  // for proportionally scaling org-wide series (burndown, cockpit flow) so
+  // they visually track the filter without distorting per-bucket detail.
+  const globalScale = useMemo(() => {
+    if (assessment.size === 0) return 1;
+    const totalCount = buckets.reduce((acc, b) => acc + b.count, 0);
+    const filteredCount = buckets.reduce((acc, b) => acc + b.count * bucketShare(b, assessment), 0);
+    return totalCount > 0 ? filteredCount / totalCount : 0;
+  }, [buckets, assessment]);
+
   // Scale per-asset entries inside world.bucketAssets so per-bucket asset
   // tables and per-asset campaign tables reflect the filter too.
   const displayWorld = useMemo(() => {
@@ -4000,9 +4854,6 @@ export default function App() {
     // Burndown — scale uniformly by the global share across all buckets so the
     // trend chart visually reflects the filter while staying smooth. Each
     // series is a flat array of numbers (one per day), not objects.
-    const totalCount = buckets.reduce((acc, b) => acc + b.count, 0);
-    const filteredCount = buckets.reduce((acc, b) => acc + b.count * bucketShare(b, assessment), 0);
-    const globalScale = totalCount > 0 ? filteredCount / totalCount : 0;
     const scaleSeries = (s) => s ? s.map(v => Math.round(v * globalScale)) : s;
     const newBurndowns = {
       global: scaleSeries(world.burndowns.global),
@@ -4021,16 +4872,25 @@ export default function App() {
       assetFindings: newAssetFindings,
       burndowns: newBurndowns,
     };
-  }, [world, buckets, assessment]);
+  }, [world, buckets, assessment, globalScale]);
 
   const totalHours = Object.values(displayHoursMap).reduce((a, b) => a + b, 0);
   const totalFindings = displayBuckets.reduce((s, b) => s + b.count, 0);
 
   const goOverview = () => navigate({ kind: 'overview' });
+  const goCockpit = () => navigate({ kind: 'cockpit' });
   const goBucket = (id) => navigate({ kind: 'bucket', bucketId: id });
   const goAsset = (assetId, bucketId) => navigate({ kind: 'asset', bucketId: bucketId || route.bucketId, assetId });
   const goFindings = (bucketId, assetId = null) => navigate({ kind: 'findings', bucketId, assetId });
   const selectTheme = (next) => navigate(undefined, next);
+  const selectView = (next) => {
+    if (next === 'cockpit') goCockpit();
+    else goOverview();
+  };
+  const setRange = useCallback(
+    (next) => navigate(undefined, undefined, undefined, undefined, next),
+    [navigate],
+  );
   const openMeta = (assetId) => setMetaAssetId(assetId);
   const closeMeta = () => setMetaAssetId(null);
   const openPicker = (bucketId) => setPickerBucketId(bucketId);
@@ -4104,6 +4964,8 @@ export default function App() {
         onJumpCampaign={(bid) => goBucket(bid)}
         onOpenSources={() => setShowAssessmentFilter(true)}
         activeSourcesCount={assessment.size}
+        currentView={route.kind === 'cockpit' ? 'cockpit' : 'overview'}
+        onSelectView={selectView}
       />
 
       {route.kind === 'overview' && (
@@ -4136,6 +4998,22 @@ export default function App() {
           />
           <Footer totalFindings={totalFindings} />
         </div>
+      )}
+
+      {route.kind === 'cockpit' && (
+        <>
+          <CockpitView
+            range={route.range}
+            onSetRange={setRange}
+            displayBuckets={displayBuckets}
+            flow={flow}
+            capLog={capLog}
+            globalScale={globalScale}
+            assessment={assessment}
+            onClearAssessment={() => setAssessment(new Set())}
+          />
+          <Footer totalFindings={totalFindings} />
+        </>
       )}
 
       {route.kind === 'bucket' && selectedBucketRaw && (
